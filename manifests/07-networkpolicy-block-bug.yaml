@@ -1,0 +1,15 @@
+# BUG #7: Overly-restrictive NetworkPolicy
+# This default-deny-all ingress policy in "backend" blocks traffic even
+# from frontend, because no allow rule was added.
+# Symptom: curl from a frontend pod to backend-api-svc times out, even
+# though pods/service/endpoints all look healthy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-all-ingress
+  namespace: backend
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  # no "ingress:" rules defined => all ingress traffic is denied

@@ -1,0 +1,8 @@
+# Cluster 2: "debug-cluster-2" — simulates a platform/monitoring cluster
+# 1 control-plane + 1 worker node
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: debug-cluster-2
+nodes:
+  - role: control-plane
+  - role: worker

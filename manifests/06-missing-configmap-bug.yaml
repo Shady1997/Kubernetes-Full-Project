@@ -1,0 +1,26 @@
+# BUG #6: CreateContainerConfigError
+# Pod references a ConfigMap "backend-config" that was never created.
+# Symptom: `kubectl describe pod` shows
+# "Error: configmap "backend-config" not found".
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-worker
+  namespace: backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend-worker
+  template:
+    metadata:
+      labels:
+        app: backend-worker
+    spec:
+      containers:
+        - name: worker
+          image: busybox:1.36
+          command: ["sh", "-c", "sleep 3600"]
+          envFrom:
+            - configMapRef:
+                name: backend-config   # this ConfigMap is never created

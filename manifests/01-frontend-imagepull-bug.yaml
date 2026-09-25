@@ -1,0 +1,38 @@
+# BUG #1: ImagePullBackOff
+# The image tag "v99.99-does-not-exist" does not exist on Docker Hub.
+# Symptom: pods stuck in ImagePullBackOff / ErrImagePull.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend-web
+  namespace: frontend
+  labels:
+    app: frontend-web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: frontend-web
+  template:
+    metadata:
+      labels:
+        app: frontend-web
+    spec:
+      containers:
+        - name: web
+          image: nginx:v99.99-does-not-exist
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-web-svc
+  namespace: frontend
+spec:
+  selector:
+    app: frontend-web
+  ports:
+    - port: 80
+      targetPort: 80
+  type: ClusterIP

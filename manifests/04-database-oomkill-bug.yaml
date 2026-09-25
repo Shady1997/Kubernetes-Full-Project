@@ -1,0 +1,46 @@
+# BUG #4: OOMKilled
+# Memory limit (16Mi) is far too low for a real database process.
+# Symptom: pod restarts with reason OOMKilled; `kubectl describe pod` shows
+# "Last State: Terminated, Reason: OOMKilled".
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: database-primary
+  namespace: database
+spec:
+  serviceName: database-primary
+  replicas: 1
+  selector:
+    matchLabels:
+      app: database-primary
+  template:
+    metadata:
+      labels:
+        app: database-primary
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - name: POSTGRES_PASSWORD
+              value: labpassword
+          resources:
+            requests:
+              memory: "8Mi"
+            limits:
+              memory: "16Mi"   # way too small; postgres will be OOMKilled
+          ports:
+            - containerPort: 5432
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: database-primary-svc
+  namespace: database
+spec:
+  selector:
+    app: database-primary
+  ports:
+    - port: 5432
+      targetPort: 5432
+  clusterIP: None

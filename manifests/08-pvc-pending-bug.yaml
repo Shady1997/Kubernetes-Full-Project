@@ -1,0 +1,43 @@
+# BUG #8: PVC stuck Pending
+# References a StorageClass "fast-ssd-premium" that doesn't exist in kind.
+# Symptom: `kubectl get pvc` shows STATUS=Pending indefinitely; pod using
+# it stays Pending too with event "waiting for a volume to be created".
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: database-backup-pvc
+  namespace: database
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: fast-ssd-premium   # does not exist on this cluster
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: database-backup-agent
+  namespace: database
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: database-backup-agent
+  template:
+    metadata:
+      labels:
+        app: database-backup-agent
+    spec:
+      containers:
+        - name: backup-agent
+          image: busybox:1.36
+          command: ["sh", "-c", "sleep 3600"]
+          volumeMounts:
+            - name: backup-vol
+              mountPath: /backup
+      volumes:
+        - name: backup-vol
+          persistentVolumeClaim:
+            claimName: database-backup-pvc

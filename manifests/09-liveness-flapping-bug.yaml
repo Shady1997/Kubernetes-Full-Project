@@ -1,0 +1,34 @@
+# BUG #9: Liveness probe with an unrealistic timeout causes constant restarts
+# The app takes ~5s to become responsive but the liveness probe starts
+# checking after only 1s with a 1s timeout and kills the container
+# before it ever gets a chance to serve traffic.
+# Symptom: pod Ready briefly then restarts endlessly; RESTARTS count climbs.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend-slow-start
+  namespace: frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend-slow-start
+  template:
+    metadata:
+      labels:
+        app: frontend-slow-start
+    spec:
+      containers:
+        - name: app
+          image: nginx:1.27-alpine
+          command: ["sh", "-c", "sleep 5 && nginx -g 'daemon off;'"]
+          ports:
+            - containerPort: 80
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 1
+            timeoutSeconds: 1
+            periodSeconds: 2
+            failureThreshold: 1

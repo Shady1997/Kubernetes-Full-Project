@@ -1,0 +1,39 @@
+# BUG #2: CrashLoopBackOff
+# The container command exits with a non-zero code immediately after start.
+# Symptom: Restart count climbing, status CrashLoopBackOff.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-api
+  namespace: backend
+  labels:
+    app: backend-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: backend-api
+  template:
+    metadata:
+      labels:
+        app: backend-api
+    spec:
+      containers:
+        - name: api
+          image: busybox:1.36
+          command: ["sh", "-c", "echo 'fatal: missing required env var API_SECRET' >&2; exit 1"]
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-api-svc
+  namespace: backend
+spec:
+  selector:
+    app: backend-api
+  ports:
+    - port: 8080
+      targetPort: 8080
+  type: ClusterIP

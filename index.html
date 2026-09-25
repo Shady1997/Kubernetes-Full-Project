@@ -1,0 +1,841 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>K8s Incident Report - default | by Shady Gomaa</title>
+<style>
+body{font-family:-apple-system,Segoe UI,Arial,sans-serif;background:#0f1115;color:#e6e6e6;margin:0;padding:24px;}
+h1{margin-top:0} h2{border-bottom:1px solid #333;padding-bottom:6px;margin-top:32px}
+.card{background:#1a1d24;border:1px solid #2a2d36;border-radius:8px;padding:16px;margin:10px 0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}
+.stat{font-size:28px;font-weight:bold} .label{color:#9aa0aa;font-size:12px;text-transform:uppercase}
+.crit{color:#ff5c5c}.err{color:#ff8c42}.warn{color:#ffd166}.ok{color:#06d6a0}
+pre{background:#0b0d11;border:1px solid #2a2d36;border-radius:6px;padding:12px;overflow-x:auto;white-space:pre-wrap;font-size:12px}
+.badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:12px;margin-left:8px}
+.badge.crit{background:#3a1414}.badge.err{background:#3a2414}.badge.warn{background:#3a3414}.badge.ok{background:#123a2c}
+.masthead{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px}
+.dev-credit{color:#9aa0aa;font-size:13px}
+table{font-size:13px} th{color:#9aa0aa;font-weight:600}
+.timeline{position:relative;margin-left:12px;padding-left:20px;border-left:2px solid #2a2d36}
+.tl-item{position:relative;margin-bottom:14px}
+.tl-item::before{content:"";position:absolute;left:-26px;top:4px;width:10px;height:10px;border-radius:50%;background:#555}
+.tl-item.crit::before{background:#ff5c5c} .tl-item.err::before{background:#ff8c42} .tl-item.warn::before{background:#ffd166}
+.tl-time{color:#9aa0aa;font-size:12px;margin-right:8px}
+</style></head><body>
+<div class="masthead">
+<h1>Kubernetes Incident Diagnostic Report</h1>
+<div class="dev-credit">Developed by <b>Shady Gomaa</b></div>
+</div>
+<div class="card">
+<div class="grid">
+<div><div class="label">Context</div><div class="stat" style="font-size:16px">default</div></div>
+<div><div class="label">Scan window</div><div class="stat" style="font-size:16px">60 min</div></div>
+<div><div class="label">From</div><div class="stat" style="font-size:14px">2026-09-25 20:26:15</div></div>
+<div><div class="label">To</div><div class="stat" style="font-size:14px">2026-09-25 21:26:15</div></div>
+<div><div class="label">Search</div><div class="stat" style="font-size:14px">Full scan</div></div>
+<div><div class="label">Occurrences</div><div class="stat">0</div></div>
+<div><div class="label">Resources hit</div><div class="stat" style="font-size:16px">0</div></div>
+<div><div class="label">Namespaces hit</div><div class="stat" style="font-size:16px">0</div></div>
+</div>
+</div>
+
+
+<div class="card">
+<div class="grid">
+<div><div class="label">Critical</div><div class="stat crit">1</div></div>
+<div><div class="label">Errors</div><div class="stat err">26</div></div>
+<div><div class="label">Warnings</div><div class="stat warn">14</div></div>
+<div><div class="label">Info</div><div class="stat ok">10</div></div>
+</div>
+</div>
+
+<div class="card">
+<h2 style="margin-top:0;border:none">Status Overview</h2>
+<div class="grid">
+<div>Control plane <span class="badge ok">HEALTHY</span></div>
+<div>Redis <span class="badge ok">DETECTED / NO READY ENDPOINTS (Service cache-svc has none)</span></div>
+<div>CoreDNS <span class="badge ok">HEALTHY</span></div>
+<div>Endpoint probes <span class="badge warn">DISABLED</span></div>
+<div>F5 / external LB <span class="badge warn">NOT CONFIGURED</span></div>
+</div>
+</div>
+<h2>Service Topology -- Service &rarr; ClusterIP &rarr; Endpoints (Ready / Not-Ready)</h2>
+<p style="color:#9aa0aa;font-size:13px">Built from EndpointSlices (falls back to legacy Endpoints if no slice exists). Each endpoint shows the backing pod name from targetRef, so you can see exactly which pod is or is not serving traffic for a service.</p>
+<div class="card" style="overflow-x:auto"><table style="width:100%;border-collapse:collapse">
+<tr style="text-align:left;border-bottom:2px solid #333"><th style="padding:6px">Namespace</th><th style="padding:6px">Service</th><th style="padding:6px">ClusterIP</th><th style="padding:6px">Ready endpoints</th><th style="padding:6px">Not-Ready endpoints</th></tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px">backend</td>
+<td style="padding:6px">backend-api-svc</td>
+<td style="padding:6px">10.43.54.78</td>
+<td style="padding:6px"><span class="badge ok">10.42.0.14(backend-api-64bb4fb7c-lh7wz) </span></td>
+<td style="padding:6px"><span class=\"badge warn\">10.42.0.15(backend-api-64bb4fb7c-lpg2q) </span></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px">backend</td>
+<td style="padding:6px">cache-svc</td>
+<td style="padding:6px">10.43.94.37</td>
+<td style="padding:6px"><span class="badge crit">NONE</span></td>
+<td style="padding:6px">--</td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px">database</td>
+<td style="padding:6px">database-primary-svc</td>
+<td style="padding:6px">None</td>
+<td style="padding:6px"><span class="badge ok">10.42.0.17(database-primary-0) </span></td>
+<td style="padding:6px">--</td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px">default</td>
+<td style="padding:6px">kubernetes</td>
+<td style="padding:6px">10.43.0.1</td>
+<td style="padding:6px"><span class="badge ok">172.16.0.19() </span></td>
+<td style="padding:6px">--</td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px">frontend</td>
+<td style="padding:6px">frontend-gateway-svc</td>
+<td style="padding:6px">10.43.8.171</td>
+<td style="padding:6px"><span class="badge ok">10.42.0.19(frontend-gateway-56b58445d9-j4s2t) 10.42.0.18(frontend-gateway-56b58445d9-zsmlb) </span></td>
+<td style="padding:6px">--</td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px">frontend</td>
+<td style="padding:6px">frontend-healthy-svc</td>
+<td style="padding:6px">10.43.97.35</td>
+<td style="padding:6px"><span class="badge ok">10.42.0.23(frontend-healthy-6cc94b54d4-gpbn7) 10.42.0.22(frontend-healthy-6cc94b54d4-4rrbk) </span></td>
+<td style="padding:6px">--</td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px">frontend</td>
+<td style="padding:6px">frontend-web-svc</td>
+<td style="padding:6px">10.43.222.100</td>
+<td style="padding:6px"><span class="badge ok">10.42.0.11(frontend-web-7b486bd884-v866q) 10.42.0.12(frontend-web-7b486bd884-j44kx) 10.42.0.10(frontend-web-7b486bd884-nqmnp) </span></td>
+<td style="padding:6px">--</td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px">kube-system</td>
+<td style="padding:6px">kube-dns</td>
+<td style="padding:6px">10.43.0.10</td>
+<td style="padding:6px"><span class="badge ok">10.42.0.2(coredns-577d995dff-wmjjl) </span></td>
+<td style="padding:6px">--</td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px">kube-system</td>
+<td style="padding:6px">metrics-server</td>
+<td style="padding:6px">10.43.99.168</td>
+<td style="padding:6px"><span class="badge ok">10.42.0.6(metrics-server-778c4649b4-swksk) </span></td>
+<td style="padding:6px">--</td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px">kube-system</td>
+<td style="padding:6px">traefik</td>
+<td style="padding:6px">10.43.134.28</td>
+<td style="padding:6px"><span class="badge ok">10.42.0.9(traefik-77b898c5c8-6wzls) </span></td>
+<td style="padding:6px">--</td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px">monitoring</td>
+<td style="padding:6px">metrics-collector-svc</td>
+<td style="padding:6px">10.43.55.182</td>
+<td style="padding:6px"><span class="badge ok">10.42.0.24(metrics-collector-5949f4cd89-5r244) </span></td>
+<td style="padding:6px">--</td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px">monitoring</td>
+<td style="padding:6px">metrics-collector-svc-wrongport</td>
+<td style="padding:6px">10.43.233.6</td>
+<td style="padding:6px"><span class="badge ok">10.42.0.24(metrics-collector-5949f4cd89-5r244) </span></td>
+<td style="padding:6px">--</td>
+</tr>
+</table></div>
+<h2>Active Endpoint Probes (opt-in live GET check)</h2>
+<div class="card">Disabled for this run. Set <code>ENABLE_ENDPOINT_PROBE=1</code> (optionally with <code>PROBE_PATH</code>, <code>PROBE_TIMEOUT</code>, <code>PROBE_PORT_OVERRIDE</code>) to have the scanner issue a live GET -- via <code>kubectl exec</code> into each endpoint pod's own container -- at <code>127.0.0.1:&lt;port&gt;PROBE_PATH</code>. This confirms the app actually answers, not just that Kubernetes reports it Ready. It proves local responsiveness only, not cross-node/NetworkPolicy reachability, and issues GET requests only -- no Kubernetes object is ever changed.</div>
+<h2>F5 / External Load Balancer</h2>
+<div class="card">Not configured for this run. Set <code>F5_LOG_SOURCE</code> (a file or directory of already-exported F5 logs) and/or <code>F5_LOG_HOOK</code> (an executable this scanner runs and reads stdout from) to fold F5/WAF findings -- blocked requests, pool member down, expired monitors, iRule drops, etc -- into this report. This scanner has no direct network access to any external appliance; it only reads what you point it at.</div>
+<h2>Incident Timeline (scan order, UTC)</h2>
+<div class="card"><div class="timeline">
+<div class="tl-item warn"><span class="tl-time">21:26:18 UTC</span><span class="badge warn">WARNING</span> Found 26 Warning event(s) with lastTimestamp inside the requested 60-minute window (of 231 total events currently retained by the API server).</div>
+<div class="tl-item err"><span class="tl-time">21:26:20 UTC</span><span class="badge err">ERROR</span> Deployment backend/backend-api READY=0 DESIRED=2.</div>
+<div class="tl-item err"><span class="tl-time">21:26:20 UTC</span><span class="badge err">ERROR</span> Deployment backend/backend-worker READY=0 DESIRED=1.</div>
+<div class="tl-item warn"><span class="tl-time">21:26:22 UTC</span><span class="badge warn">WARNING</span> Service backend/backend-api-svc (ClusterIP 10.43.54.78) is partially degraded -- ready: 10.42.0.14(backend-api-64bb4fb7c-lh7wz)  | not-ready: 10.42.0.15(backend-api-64bb4fb7c-lpg2q) </div>
+<div class="tl-item err"><span class="tl-time">21:26:23 UTC</span><span class="badge err">ERROR</span> Service backend/cache-svc (ClusterIP 10.43.94.37) has NO active endpoints (ready or not-ready).</div>
+<div class="tl-item warn"><span class="tl-time">21:26:25 UTC</span><span class="badge warn">WARNING</span> Pod backend/backend-api-64bb4fb7c-lh7wz is Running but not Ready (readiness probe likely failing).</div>
+<div class="tl-item err"><span class="tl-time">21:26:26 UTC</span><span class="badge err">ERROR</span> Errors found in backend/backend-api-64bb4fb7c-lh7wz/api logs (last 60m).</div>
+<div class="tl-item warn"><span class="tl-time">21:26:26 UTC</span><span class="badge warn">WARNING</span> Container backend/backend-api-64bb4fb7c-lh7wz/api restarted 5 time(s). Last reason=Error exitCode=1 finishedAt=2026-09-25T21:24:57Z</div>
+<div class="tl-item warn"><span class="tl-time">21:26:26 UTC</span><span class="badge warn">WARNING</span> Pod backend/backend-api-64bb4fb7c-lpg2q is Running but not Ready (readiness probe likely failing).</div>
+<div class="tl-item err"><span class="tl-time">21:26:27 UTC</span><span class="badge err">ERROR</span> Errors found in backend/backend-api-64bb4fb7c-lpg2q/api logs (last 60m).</div>
+<div class="tl-item warn"><span class="tl-time">21:26:27 UTC</span><span class="badge warn">WARNING</span> Container backend/backend-api-64bb4fb7c-lpg2q/api restarted 4 time(s). Last reason=Error exitCode=1 finishedAt=2026-09-25T21:24:05Z</div>
+<div class="tl-item err"><span class="tl-time">21:26:28 UTC</span><span class="badge err">ERROR</span> Pod backend/backend-worker-6b68fd9867-mdgn5 is Pending. (node=k3s-server)</div>
+<div class="tl-item err"><span class="tl-time">21:26:29 UTC</span><span class="badge err">ERROR</span> Errors found in backend/backend-worker-6b68fd9867-mdgn5/worker logs (last 60m).</div>
+<div class="tl-item err"><span class="tl-time">21:26:33 UTC</span><span class="badge err">ERROR</span> Deployment database/database-backup-agent READY=0 DESIRED=1.</div>
+<div class="tl-item err"><span class="tl-time">21:26:33 UTC</span><span class="badge err">ERROR</span> StatefulSet database/database-primary READY=0 DESIRED=1.</div>
+<div class="tl-item err"><span class="tl-time">21:26:34 UTC</span><span class="badge err">ERROR</span> Service database/database-primary-svc (ClusterIP None) has endpoints but NONE are Ready: 10.42.0.17(database-primary-0) </div>
+<div class="tl-item err"><span class="tl-time">21:26:36 UTC</span><span class="badge err">ERROR</span> Pod database/database-backup-agent-8c8f84bd7-dnbdr is Pending. (node=)</div>
+<div class="tl-item warn"><span class="tl-time">21:26:37 UTC</span><span class="badge warn">WARNING</span> Pod database/database-primary-0 is Running but not Ready (readiness probe likely failing).</div>
+<div class="tl-item crit"><span class="tl-time">21:26:38 UTC</span><span class="badge crit">CRITICAL</span> Container database/database-primary-0/postgres was OOMKilled (exitCode=137, finishedAt=2026-09-25T21:25:20Z).</div>
+<div class="tl-item warn"><span class="tl-time">21:26:38 UTC</span><span class="badge warn">WARNING</span> Container database/database-primary-0/postgres restarted 4 time(s). Last reason=OOMKilled exitCode=137 finishedAt=2026-09-25T21:25:20Z</div>
+<div class="tl-item err"><span class="tl-time">21:26:42 UTC</span><span class="badge err">ERROR</span> Deployment frontend/frontend-gateway READY=0 DESIRED=2.</div>
+<div class="tl-item err"><span class="tl-time">21:26:43 UTC</span><span class="badge err">ERROR</span> Deployment frontend/frontend-slow-start READY=0 DESIRED=1.</div>
+<div class="tl-item err"><span class="tl-time">21:26:43 UTC</span><span class="badge err">ERROR</span> Deployment frontend/frontend-web READY=0 DESIRED=3.</div>
+<div class="tl-item err"><span class="tl-time">21:26:44 UTC</span><span class="badge err">ERROR</span> Service frontend/frontend-gateway-svc (ClusterIP 10.43.8.171) has endpoints but NONE are Ready: 10.42.0.19(frontend-gateway-56b58445d9-j4s2t) 10.42.0.18(frontend-gateway-56b58445d9-zsmlb) </div>
+<div class="tl-item err"><span class="tl-time">21:26:45 UTC</span><span class="badge err">ERROR</span> Service frontend/frontend-web-svc (ClusterIP 10.43.222.100) has endpoints but NONE are Ready: 10.42.0.11(frontend-web-7b486bd884-v866q) 10.42.0.12(frontend-web-7b486bd884-j44kx) 10.42.0.10(frontend-web-7b486bd884-nqmnp) </div>
+<div class="tl-item warn"><span class="tl-time">21:26:46 UTC</span><span class="badge warn">WARNING</span> Pod frontend/frontend-gateway-56b58445d9-j4s2t is Running but not Ready (readiness probe likely failing).</div>
+<div class="tl-item warn"><span class="tl-time">21:26:48 UTC</span><span class="badge warn">WARNING</span> Pod frontend/frontend-gateway-56b58445d9-zsmlb is Running but not Ready (readiness probe likely failing).</div>
+<div class="tl-item warn"><span class="tl-time">21:26:54 UTC</span><span class="badge warn">WARNING</span> Container frontend/frontend-slow-start-b44b8d558-j7xm7/app restarted 4 time(s). Last reason=Error exitCode=137 finishedAt=2026-09-25T21:26:15Z</div>
+<div class="tl-item warn"><span class="tl-time">21:26:54 UTC</span><span class="badge warn">WARNING</span> Pod frontend/frontend-slow-start-b44b8d558-j7xm7 is Running but not Ready (readiness probe likely failing).</div>
+<div class="tl-item err"><span class="tl-time">21:26:55 UTC</span><span class="badge err">ERROR</span> Pod frontend/frontend-web-7b486bd884-j44kx is Pending. (node=k3s-server)</div>
+<div class="tl-item err"><span class="tl-time">21:26:56 UTC</span><span class="badge err">ERROR</span> Errors found in frontend/frontend-web-7b486bd884-j44kx/web logs (last 60m).</div>
+<div class="tl-item err"><span class="tl-time">21:26:57 UTC</span><span class="badge err">ERROR</span> Pod frontend/frontend-web-7b486bd884-nqmnp is Pending. (node=k3s-server)</div>
+<div class="tl-item err"><span class="tl-time">21:26:58 UTC</span><span class="badge err">ERROR</span> Errors found in frontend/frontend-web-7b486bd884-nqmnp/web logs (last 60m).</div>
+<div class="tl-item err"><span class="tl-time">21:26:58 UTC</span><span class="badge err">ERROR</span> Pod frontend/frontend-web-7b486bd884-v866q is Pending. (node=k3s-server)</div>
+<div class="tl-item err"><span class="tl-time">21:27:00 UTC</span><span class="badge err">ERROR</span> Errors found in frontend/frontend-web-7b486bd884-v866q/web logs (last 60m).</div>
+<div class="tl-item err"><span class="tl-time">21:27:12 UTC</span><span class="badge err">ERROR</span> Errors found in kube-system/helm-install-gateway-api-crd-ft8l9/helm logs (last 60m).</div>
+<div class="tl-item err"><span class="tl-time">21:27:13 UTC</span><span class="badge err">ERROR</span> Errors found in kube-system/helm-install-traefik-crd-zhp8g/helm logs (last 60m).</div>
+<div class="tl-item err"><span class="tl-time">21:27:15 UTC</span><span class="badge err">ERROR</span> Errors found in kube-system/helm-install-traefik-dp2v2/helm logs (last 60m).</div>
+<div class="tl-item warn"><span class="tl-time">21:27:15 UTC</span><span class="badge warn">WARNING</span> Container kube-system/helm-install-traefik-dp2v2/helm restarted 1 time(s). Last reason=Error exitCode=1 finishedAt=2026-09-25T21:06:17Z</div>
+<div class="tl-item err"><span class="tl-time">21:27:18 UTC</span><span class="badge err">ERROR</span> Errors found in kube-system/metrics-server-778c4649b4-swksk/metrics-server logs (last 60m).</div>
+<div class="tl-item warn"><span class="tl-time">21:27:32 UTC</span><span class="badge warn">WARNING</span> PVCs not in Bound state detected.</div>
+</div></div>
+<h2>Root Cause Analysis (4 candidate(s))</h2>
+<p style="color:#9aa0aa;font-size:13px">Evidence-based correlation across the resources touched during this scan. These are ranked "investigation leads" based on how upstream a finding typically is -- not proven causation. Always confirm with the suggested read-only commands before acting.</p>
+<div class="card"><h3>Root-Cause Candidate / Investigation Lead #1 <span class="badge err">ns: backend</span></h3>
+<p><b>Category:</b> NO_ENDPOINTS<br><b>Resource:</b> backend/cache-svc<br><b>Likely owner:</b> Developer (readiness probe / selector) or Network team (policy) -- needs joint review</p>
+<p><b>Evidence:</b> Service cache-svc (10.43.94.37) has zero endpoints at all -- either no pod matches the selector, or all matching pods were removed</p>
+<p><b>Related evidence (likely downstream symptoms):</b></p><pre>
+[READINESS_FAIL] backend/backend-api-64bb4fb7c-lh7wz: Running but Ready=False -- readiness probe failing, pod is excluded from Service endpoints  2026-09-25 21:26:25
+[READINESS_FAIL] backend/backend-api-64bb4fb7c-lpg2q: Running but Ready=False -- readiness probe failing, pod is excluded from Service endpoints  2026-09-25 21:26:26
+[PARTIAL_NOT_READY] backend/backend-api-svc: Ready: 10.42.0.14(backend-api-64bb4fb7c-lh7wz)  | NotReady: 10.42.0.15(backend-api-64bb4fb7c-lpg2q)  -- some backing pods are failing readiness while others serve traffic   2026-09-25 21:26:22
+[RESTART] backend/backend-api-64bb4fb7c-lh7wz/api: 5 restart(s), lastReason=Error exitCode=1 finishedAt=2026-09-25T21:24:57Z    2026-09-25 21:26:26
+[RESTART] backend/backend-api-64bb4fb7c-lpg2q/api: 4 restart(s), lastReason=Error exitCode=1 finishedAt=2026-09-25T21:24:05Z    2026-09-25 21:26:27
+[PENDING] backend/backend-worker-6b68fd9867-mdgn5: Pending on node=k3s-server -- check scheduling/resource requests     2026-09-25 21:26:28
+[LOG_ERROR] backend/backend-api-64bb4fb7c-lh7wz/api: 2026-09-25T21:26:21.723071703Z fatal: missing required env var API_SECRET  2026-09-25 21:26:21
+[LOG_ERROR] backend/backend-api-64bb4fb7c-lpg2q/api: 2026-09-25T21:25:00.757047180Z fatal: missing required env var API_SECRET  2026-09-25 21:25:00
+[LOG_ERROR] backend/backend-worker-6b68fd9867-mdgn5/worker: Error from server (BadRequest): container "worker" in pod "backend-worker-6b68fd9867-mdgn5" is waiting to start: CreateContainerConfigError   2026-09-25 21:26:29
+</pre>
+<p><b>Suggested commands (read-only):</b></p><pre>kubectl describe svc cache-svc -n backend
+kubectl get endpointslices -n backend -l kubernetes.io/service-name=cache-svc -o wide
+kubectl get pods -n backend --show-labels</pre></div>
+<div class="card"><h3>Root-Cause Candidate / Investigation Lead #2 <span class="badge err">ns: database</span></h3>
+<p><b>Category:</b> NO_ENDPOINTS<br><b>Resource:</b> database/database-primary-svc<br><b>Likely owner:</b> Developer (readiness probe / selector) or Network team (policy) -- needs joint review</p>
+<p><b>Evidence:</b> Service database-primary-svc (None) has endpoints but all are NotReady: 10.42.0.17(database-primary-0)  -- pods exist but are failing readiness</p>
+<p><b>Related evidence (likely downstream symptoms):</b></p><pre>
+[READINESS_FAIL] database/database-primary-0: Running but Ready=False -- readiness probe failing, pod is excluded from Service endpoints  2026-09-25 21:26:37
+[OOM] database/database-primary-0/postgres: OOMKilled at 2026-09-25T21:25:20Z (exitCode=137) -- either app memory leak/spike or limits set too low        2026-09-25 21:26:38
+[RESTART] database/database-primary-0/postgres: 4 restart(s), lastReason=OOMKilled exitCode=137 finishedAt=2026-09-25T21:25:20Z 2026-09-25 21:26:38
+[PENDING] database/database-backup-agent-8c8f84bd7-dnbdr: Pending on node= -- check scheduling/resource requests        2026-09-25 21:26:36
+[STATEFULSET_NOT_READY] database/database-primary: StatefulSet database-primary: 0/1 replicas ready     2026-09-25 21:26:33
+</pre>
+<p><b>Suggested commands (read-only):</b></p><pre>kubectl describe svc database-primary-svc -n database
+kubectl get endpointslices -n database -l kubernetes.io/service-name=database-primary-svc -o wide
+kubectl get pods -n database --show-labels</pre></div>
+<div class="card"><h3>Root-Cause Candidate / Investigation Lead #3 <span class="badge err">ns: frontend</span></h3>
+<p><b>Category:</b> NO_ENDPOINTS<br><b>Resource:</b> frontend/frontend-gateway-svc<br><b>Likely owner:</b> Developer (readiness probe / selector) or Network team (policy) -- needs joint review</p>
+<p><b>Evidence:</b> Service frontend-gateway-svc (10.43.8.171) has endpoints but all are NotReady: 10.42.0.19(frontend-gateway-56b58445d9-j4s2t) 10.42.0.18(frontend-gateway-56b58445d9-zsmlb)  -- pods exist but are failing readiness</p>
+<p><b>Related evidence (likely downstream symptoms):</b></p><pre>
+[NO_ENDPOINTS] frontend/frontend-web-svc: Service frontend-web-svc (10.43.222.100) has endpoints but all are NotReady: 10.42.0.11(frontend-web-7b486bd884-v866q) 10.42.0.12(frontend-web-7b486bd884-j44kx) 10.42.0.10(frontend-web-7b486bd884-nqmnp)  -- pods exist but are failing readiness       2026-09-25 21:26:45
+[READINESS_FAIL] frontend/frontend-gateway-56b58445d9-j4s2t: Running but Ready=False -- readiness probe failing, pod is excluded from Service endpoints   2026-09-25 21:26:46
+[READINESS_FAIL] frontend/frontend-gateway-56b58445d9-zsmlb: Running but Ready=False -- readiness probe failing, pod is excluded from Service endpoints   2026-09-25 21:26:48
+[READINESS_FAIL] frontend/frontend-slow-start-b44b8d558-j7xm7: Running but Ready=False -- readiness probe failing, pod is excluded from Service endpoints 2026-09-25 21:26:54
+[RESTART] frontend/frontend-slow-start-b44b8d558-j7xm7/app: 4 restart(s), lastReason=Error exitCode=137 finishedAt=2026-09-25T21:26:15Z   2026-09-25 21:26:54
+[PENDING] frontend/frontend-web-7b486bd884-j44kx: Pending on node=k3s-server -- check scheduling/resource requests      2026-09-25 21:26:55
+[PENDING] frontend/frontend-web-7b486bd884-nqmnp: Pending on node=k3s-server -- check scheduling/resource requests      2026-09-25 21:26:57
+[PENDING] frontend/frontend-web-7b486bd884-v866q: Pending on node=k3s-server -- check scheduling/resource requests      2026-09-25 21:26:58
+[LOG_ERROR] frontend/frontend-web-7b486bd884-j44kx/web: Error from server (BadRequest): container "web" in pod "frontend-web-7b486bd884-j44kx" is waiting to start: trying and failing to pull image      2026-09-25 21:26:56
+[LOG_ERROR] frontend/frontend-web-7b486bd884-nqmnp/web: Error from server (BadRequest): container "web" in pod "frontend-web-7b486bd884-nqmnp" is waiting to start: trying and failing to pull image      2026-09-25 21:26:58
+[LOG_ERROR] frontend/frontend-web-7b486bd884-v866q/web: Error from server (BadRequest): container "web" in pod "frontend-web-7b486bd884-v866q" is waiting to start: trying and failing to pull image      2026-09-25 21:27:00
+</pre>
+<p><b>Suggested commands (read-only):</b></p><pre>kubectl describe svc frontend-gateway-svc -n frontend
+kubectl get endpointslices -n frontend -l kubernetes.io/service-name=frontend-gateway-svc -o wide
+kubectl get pods -n frontend --show-labels</pre></div>
+<div class="card"><h3>Root-Cause Candidate / Investigation Lead #4 <span class="badge err">ns: kube-system</span></h3>
+<p><b>Category:</b> RESTART<br><b>Resource:</b> kube-system/helm-install-traefik-dp2v2/helm<br><b>Likely owner:</b> Application developer</p>
+<p><b>Evidence:</b> 1 restart(s), lastReason=Error exitCode=1 finishedAt=2026-09-25T21:06:17Z</p>
+<p><b>Related evidence (likely downstream symptoms):</b></p><pre>
+[LOG_ERROR] kube-system/helm-install-gateway-api-crd-ft8l9/helm: 2026-09-25T21:06:18.398383972Z Error: no repositories configured2026-09-25 21:06:18
+[LOG_ERROR] kube-system/helm-install-traefik-crd-zhp8g/helm: 2026-09-25T21:06:15.582770970Z Error: no repositories configured   2026-09-25 21:06:15
+[LOG_ERROR] kube-system/helm-install-traefik-dp2v2/helm: 2026-09-25T21:06:18.113161621Z Error: no repositories configured       2026-09-25 21:06:18
+[LOG_ERROR] kube-system/metrics-server-778c4649b4-swksk/metrics-server: 2026-09-25T21:06:17.664917835Z I0925 21:06:17.664085       1 tlsconfig.go:243] "Starting DynamicServingCertificateController"     2026-09-25 21:06:17
+</pre>
+<p><b>Suggested commands (read-only):</b></p><pre>kubectl logs helm-install-traefik-dp2v2 -n kube-system -c helm --previous --timestamps
+kubectl describe pod helm-install-traefik-dp2v2 -n kube-system</pre></div>
+<h2>Error Catalog -- every finding (33), by pod &amp; timestamp</h2>
+<p style="color:#9aa0aa;font-size:13px">Every individual error/warning detected in this scan window, with the exact pod/container, when it happened (log timestamp when available, else scan time), which team likely owns the fix, and the read-only command(s) to confirm before acting.</p>
+<div class="card" style="overflow-x:auto">
+<table style="width:100%;border-collapse:collapse;font-size:13px">
+<tr style="text-align:left;border-bottom:2px solid #333"><th style="padding:6px">Timestamp</th><th style="padding:6px">Namespace / Pod</th><th style="padding:6px">Category</th><th style="padding:6px">Owner Team</th><th style="padding:6px">Root Cause / Detail</th><th style="padding:6px">Suggested Commands</th></tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:06:15</td>
+<td style="padding:6px">kube-system/helm-install-traefik-crd-zhp8g/helm</td>
+<td style="padding:6px"><span class="badge warn">LOG_ERROR</span></td>
+<td style="padding:6px">Application developer</td>
+<td style="padding:6px">2026-09-25T21:06:15.582770970Z Error: no repositories configured</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl logs helm-install-traefik-crd-zhp8g -n kube-system -c helm --since=60m --timestamps</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:06:17</td>
+<td style="padding:6px">kube-system/metrics-server-778c4649b4-swksk/metrics-server</td>
+<td style="padding:6px"><span class="badge warn">LOG_ERROR</span></td>
+<td style="padding:6px">Application developer</td>
+<td style="padding:6px">2026-09-25T21:06:17.664917835Z I0925 21:06:17.664085       1 tlsconfig.go:243] "Starting DynamicServingCertificateController"</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl logs metrics-server-778c4649b4-swksk -n kube-system -c metrics-server --since=60m --timestamps</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:06:18</td>
+<td style="padding:6px">kube-system/helm-install-gateway-api-crd-ft8l9/helm</td>
+<td style="padding:6px"><span class="badge warn">LOG_ERROR</span></td>
+<td style="padding:6px">Application developer</td>
+<td style="padding:6px">2026-09-25T21:06:18.398383972Z Error: no repositories configured</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl logs helm-install-gateway-api-crd-ft8l9 -n kube-system -c helm --since=60m --timestamps</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:06:18</td>
+<td style="padding:6px">kube-system/helm-install-traefik-dp2v2/helm</td>
+<td style="padding:6px"><span class="badge warn">LOG_ERROR</span></td>
+<td style="padding:6px">Application developer</td>
+<td style="padding:6px">2026-09-25T21:06:18.113161621Z Error: no repositories configured</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl logs helm-install-traefik-dp2v2 -n kube-system -c helm --since=60m --timestamps</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:25:00</td>
+<td style="padding:6px">backend/backend-api-64bb4fb7c-lpg2q/api</td>
+<td style="padding:6px"><span class="badge warn">LOG_ERROR</span></td>
+<td style="padding:6px">Application developer</td>
+<td style="padding:6px">2026-09-25T21:25:00.757047180Z fatal: missing required env var API_SECRET</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl logs backend-api-64bb4fb7c-lpg2q -n backend -c api --since=60m --timestamps</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:26:21</td>
+<td style="padding:6px">backend/backend-api-64bb4fb7c-lh7wz/api</td>
+<td style="padding:6px"><span class="badge warn">LOG_ERROR</span></td>
+<td style="padding:6px">Application developer</td>
+<td style="padding:6px">2026-09-25T21:26:21.723071703Z fatal: missing required env var API_SECRET</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl logs backend-api-64bb4fb7c-lh7wz -n backend -c api --since=60m --timestamps</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:26:22</td>
+<td style="padding:6px">backend/backend-api-svc</td>
+<td style="padding:6px"><span class="badge err">PARTIAL_NOT_READY</span></td>
+<td style="padding:6px">Application developer</td>
+<td style="padding:6px">Ready: 10.42.0.14(backend-api-64bb4fb7c-lh7wz)  | NotReady: 10.42.0.15(backend-api-64bb4fb7c-lpg2q)  -- some backing pods are failing readiness while others serve traffic</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl describe pod backend-api-svc -n backend</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:26:23</td>
+<td style="padding:6px">backend/cache-svc</td>
+<td style="padding:6px"><span class="badge err">NO_ENDPOINTS</span></td>
+<td style="padding:6px">Developer (readiness probe / selector) or Network team (policy) -- needs joint review</td>
+<td style="padding:6px">Service cache-svc (10.43.94.37) has zero endpoints at all -- either no pod matches the selector, or all matching pods were removed</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl describe svc cache-svc -n backend
+kubectl get endpointslices -n backend -l kubernetes.io/service-name=cache-svc -o wide
+kubectl get pods -n backend --show-labels</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:26:25</td>
+<td style="padding:6px">backend/backend-api-64bb4fb7c-lh7wz</td>
+<td style="padding:6px"><span class="badge err">READINESS_FAIL</span></td>
+<td style="padding:6px">Application developer</td>
+<td style="padding:6px">Running but Ready=False -- readiness probe failing, pod is excluded from Service endpoints</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl describe pod backend-api-64bb4fb7c-lh7wz -n backend
+kubectl logs backend-api-64bb4fb7c-lh7wz -n backend --since=60m</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:26:26</td>
+<td style="padding:6px">backend/backend-api-64bb4fb7c-lpg2q</td>
+<td style="padding:6px"><span class="badge err">READINESS_FAIL</span></td>
+<td style="padding:6px">Application developer</td>
+<td style="padding:6px">Running but Ready=False -- readiness probe failing, pod is excluded from Service endpoints</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl describe pod backend-api-64bb4fb7c-lpg2q -n backend
+kubectl logs backend-api-64bb4fb7c-lpg2q -n backend --since=60m</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:26:26</td>
+<td style="padding:6px">backend/backend-api-64bb4fb7c-lh7wz/api</td>
+<td style="padding:6px"><span class="badge err">RESTART</span></td>
+<td style="padding:6px">Application developer</td>
+<td style="padding:6px">5 restart(s), lastReason=Error exitCode=1 finishedAt=2026-09-25T21:24:57Z</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl logs backend-api-64bb4fb7c-lh7wz -n backend -c api --previous --timestamps
+kubectl describe pod backend-api-64bb4fb7c-lh7wz -n backend</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:26:27</td>
+<td style="padding:6px">backend/backend-api-64bb4fb7c-lpg2q/api</td>
+<td style="padding:6px"><span class="badge err">RESTART</span></td>
+<td style="padding:6px">Application developer</td>
+<td style="padding:6px">4 restart(s), lastReason=Error exitCode=1 finishedAt=2026-09-25T21:24:05Z</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl logs backend-api-64bb4fb7c-lpg2q -n backend -c api --previous --timestamps
+kubectl describe pod backend-api-64bb4fb7c-lpg2q -n backend</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:26:28</td>
+<td style="padding:6px">backend/backend-worker-6b68fd9867-mdgn5</td>
+<td style="padding:6px"><span class="badge err">PENDING</span></td>
+<td style="padding:6px">Infra (limits) or Developer (memory usage) -- needs joint review</td>
+<td style="padding:6px">Pending on node=k3s-server -- check scheduling/resource requests</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl describe pod backend-worker-6b68fd9867-mdgn5 -n backend
+kubectl top nodes
+kubectl get resourcequota -n backend</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:26:29</td>
+<td style="padding:6px">backend/backend-worker-6b68fd9867-mdgn5/worker</td>
+<td style="padding:6px"><span class="badge warn">LOG_ERROR</span></td>
+<td style="padding:6px">Application developer</td>
+<td style="padding:6px">Error from server (BadRequest): container "worker" in pod "backend-worker-6b68fd9867-mdgn5" is waiting to start: CreateContainerConfigError</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl logs backend-worker-6b68fd9867-mdgn5 -n backend -c worker --since=60m --timestamps</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:26:33</td>
+<td style="padding:6px">database/database-primary</td>
+<td style="padding:6px"><span class="badge err">STATEFULSET_NOT_READY</span></td>
+<td style="padding:6px">Infra (limits) or Developer (memory usage) -- needs joint review</td>
+<td style="padding:6px">StatefulSet database-primary: 0/1 replicas ready</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl describe statefulset database-primary -n database
+kubectl get pods -n database -l app=database-primary</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:26:34</td>
+<td style="padding:6px">database/database-primary-svc</td>
+<td style="padding:6px"><span class="badge err">NO_ENDPOINTS</span></td>
+<td style="padding:6px">Developer (readiness probe / selector) or Network team (policy) -- needs joint review</td>
+<td style="padding:6px">Service database-primary-svc (None) has endpoints but all are NotReady: 10.42.0.17(database-primary-0)  -- pods exist but are failing readiness</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl describe svc database-primary-svc -n database
+kubectl get endpointslices -n database -l kubernetes.io/service-name=database-primary-svc -o wide
+kubectl get pods -n database --show-labels</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:26:36</td>
+<td style="padding:6px">database/database-backup-agent-8c8f84bd7-dnbdr</td>
+<td style="padding:6px"><span class="badge err">PENDING</span></td>
+<td style="padding:6px">Infra (limits) or Developer (memory usage) -- needs joint review</td>
+<td style="padding:6px">Pending on node= -- check scheduling/resource requests</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl describe pod database-backup-agent-8c8f84bd7-dnbdr -n database
+kubectl top nodes
+kubectl get resourcequota -n database</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:26:37</td>
+<td style="padding:6px">database/database-primary-0</td>
+<td style="padding:6px"><span class="badge err">READINESS_FAIL</span></td>
+<td style="padding:6px">Application developer</td>
+<td style="padding:6px">Running but Ready=False -- readiness probe failing, pod is excluded from Service endpoints</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl describe pod database-primary-0 -n database
+kubectl logs database-primary-0 -n database --since=60m</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:26:38</td>
+<td style="padding:6px">database/database-primary-0/postgres</td>
+<td style="padding:6px"><span class="badge err">OOM</span></td>
+<td style="padding:6px">Infra or Developer</td>
+<td style="padding:6px">OOMKilled at 2026-09-25T21:25:20Z (exitCode=137) -- either app memory leak/spike or limits set too low</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl top pod database-primary-0 -n database
+kubectl get pod database-primary-0 -n database -o yaml   # check resources.limits.memory</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:26:38</td>
+<td style="padding:6px">database/database-primary-0/postgres</td>
+<td style="padding:6px"><span class="badge err">RESTART</span></td>
+<td style="padding:6px">Application developer</td>
+<td style="padding:6px">4 restart(s), lastReason=OOMKilled exitCode=137 finishedAt=2026-09-25T21:25:20Z</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl logs database-primary-0 -n database -c postgres --previous --timestamps
+kubectl describe pod database-primary-0 -n database</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:26:44</td>
+<td style="padding:6px">frontend/frontend-gateway-svc</td>
+<td style="padding:6px"><span class="badge err">NO_ENDPOINTS</span></td>
+<td style="padding:6px">Developer (readiness probe / selector) or Network team (policy) -- needs joint review</td>
+<td style="padding:6px">Service frontend-gateway-svc (10.43.8.171) has endpoints but all are NotReady: 10.42.0.19(frontend-gateway-56b58445d9-j4s2t) 10.42.0.18(frontend-gateway-56b58445d9-zsmlb)  -- pods exist but are failing readiness</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl describe svc frontend-gateway-svc -n frontend
+kubectl get endpointslices -n frontend -l kubernetes.io/service-name=frontend-gateway-svc -o wide
+kubectl get pods -n frontend --show-labels</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:26:45</td>
+<td style="padding:6px">frontend/frontend-web-svc</td>
+<td style="padding:6px"><span class="badge err">NO_ENDPOINTS</span></td>
+<td style="padding:6px">Developer (readiness probe / selector) or Network team (policy) -- needs joint review</td>
+<td style="padding:6px">Service frontend-web-svc (10.43.222.100) has endpoints but all are NotReady: 10.42.0.11(frontend-web-7b486bd884-v866q) 10.42.0.12(frontend-web-7b486bd884-j44kx) 10.42.0.10(frontend-web-7b486bd884-nqmnp)  -- pods exist but are failing readiness</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl describe svc frontend-web-svc -n frontend
+kubectl get endpointslices -n frontend -l kubernetes.io/service-name=frontend-web-svc -o wide
+kubectl get pods -n frontend --show-labels</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:26:46</td>
+<td style="padding:6px">frontend/frontend-gateway-56b58445d9-j4s2t</td>
+<td style="padding:6px"><span class="badge err">READINESS_FAIL</span></td>
+<td style="padding:6px">Application developer</td>
+<td style="padding:6px">Running but Ready=False -- readiness probe failing, pod is excluded from Service endpoints</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl describe pod frontend-gateway-56b58445d9-j4s2t -n frontend
+kubectl logs frontend-gateway-56b58445d9-j4s2t -n frontend --since=60m</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:26:48</td>
+<td style="padding:6px">frontend/frontend-gateway-56b58445d9-zsmlb</td>
+<td style="padding:6px"><span class="badge err">READINESS_FAIL</span></td>
+<td style="padding:6px">Application developer</td>
+<td style="padding:6px">Running but Ready=False -- readiness probe failing, pod is excluded from Service endpoints</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl describe pod frontend-gateway-56b58445d9-zsmlb -n frontend
+kubectl logs frontend-gateway-56b58445d9-zsmlb -n frontend --since=60m</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:26:54</td>
+<td style="padding:6px">frontend/frontend-slow-start-b44b8d558-j7xm7</td>
+<td style="padding:6px"><span class="badge err">READINESS_FAIL</span></td>
+<td style="padding:6px">Application developer</td>
+<td style="padding:6px">Running but Ready=False -- readiness probe failing, pod is excluded from Service endpoints</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl describe pod frontend-slow-start-b44b8d558-j7xm7 -n frontend
+kubectl logs frontend-slow-start-b44b8d558-j7xm7 -n frontend --since=60m</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:26:54</td>
+<td style="padding:6px">frontend/frontend-slow-start-b44b8d558-j7xm7/app</td>
+<td style="padding:6px"><span class="badge err">RESTART</span></td>
+<td style="padding:6px">Application developer</td>
+<td style="padding:6px">4 restart(s), lastReason=Error exitCode=137 finishedAt=2026-09-25T21:26:15Z</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl logs frontend-slow-start-b44b8d558-j7xm7 -n frontend -c app --previous --timestamps
+kubectl describe pod frontend-slow-start-b44b8d558-j7xm7 -n frontend</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:26:55</td>
+<td style="padding:6px">frontend/frontend-web-7b486bd884-j44kx</td>
+<td style="padding:6px"><span class="badge err">PENDING</span></td>
+<td style="padding:6px">Infra (limits) or Developer (memory usage) -- needs joint review</td>
+<td style="padding:6px">Pending on node=k3s-server -- check scheduling/resource requests</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl describe pod frontend-web-7b486bd884-j44kx -n frontend
+kubectl top nodes
+kubectl get resourcequota -n frontend</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:26:56</td>
+<td style="padding:6px">frontend/frontend-web-7b486bd884-j44kx/web</td>
+<td style="padding:6px"><span class="badge warn">LOG_ERROR</span></td>
+<td style="padding:6px">Application developer</td>
+<td style="padding:6px">Error from server (BadRequest): container "web" in pod "frontend-web-7b486bd884-j44kx" is waiting to start: trying and failing to pull image</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl logs frontend-web-7b486bd884-j44kx -n frontend -c web --since=60m --timestamps</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:26:57</td>
+<td style="padding:6px">frontend/frontend-web-7b486bd884-nqmnp</td>
+<td style="padding:6px"><span class="badge err">PENDING</span></td>
+<td style="padding:6px">Infra (limits) or Developer (memory usage) -- needs joint review</td>
+<td style="padding:6px">Pending on node=k3s-server -- check scheduling/resource requests</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl describe pod frontend-web-7b486bd884-nqmnp -n frontend
+kubectl top nodes
+kubectl get resourcequota -n frontend</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:26:58</td>
+<td style="padding:6px">frontend/frontend-web-7b486bd884-v866q</td>
+<td style="padding:6px"><span class="badge err">PENDING</span></td>
+<td style="padding:6px">Infra (limits) or Developer (memory usage) -- needs joint review</td>
+<td style="padding:6px">Pending on node=k3s-server -- check scheduling/resource requests</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl describe pod frontend-web-7b486bd884-v866q -n frontend
+kubectl top nodes
+kubectl get resourcequota -n frontend</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:26:58</td>
+<td style="padding:6px">frontend/frontend-web-7b486bd884-nqmnp/web</td>
+<td style="padding:6px"><span class="badge warn">LOG_ERROR</span></td>
+<td style="padding:6px">Application developer</td>
+<td style="padding:6px">Error from server (BadRequest): container "web" in pod "frontend-web-7b486bd884-nqmnp" is waiting to start: trying and failing to pull image</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl logs frontend-web-7b486bd884-nqmnp -n frontend -c web --since=60m --timestamps</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:27:00</td>
+<td style="padding:6px">frontend/frontend-web-7b486bd884-v866q/web</td>
+<td style="padding:6px"><span class="badge warn">LOG_ERROR</span></td>
+<td style="padding:6px">Application developer</td>
+<td style="padding:6px">Error from server (BadRequest): container "web" in pod "frontend-web-7b486bd884-v866q" is waiting to start: trying and failing to pull image</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl logs frontend-web-7b486bd884-v866q -n frontend -c web --since=60m --timestamps</pre></td>
+</tr>
+<tr style="border-bottom:1px solid #2a2d36">
+<td style="padding:6px;white-space:nowrap">2026-09-25 21:27:15</td>
+<td style="padding:6px">kube-system/helm-install-traefik-dp2v2/helm</td>
+<td style="padding:6px"><span class="badge err">RESTART</span></td>
+<td style="padding:6px">Application developer</td>
+<td style="padding:6px">1 restart(s), lastReason=Error exitCode=1 finishedAt=2026-09-25T21:06:17Z</td>
+<td style="padding:6px"><pre style="margin:0;background:none;border:none;padding:0">kubectl logs helm-install-traefik-dp2v2 -n kube-system -c helm --previous --timestamps
+kubectl describe pod helm-install-traefik-dp2v2 -n kube-system</pre></td>
+</tr>
+</table>
+</div>
+<h2>Errors and Warnings -- full, untruncated (189 lines)</h2>
+<p style="color:#9aa0aa;font-size:13px">This is the complete content matched during the scan -- not an excerpt -- so nothing needed for debugging is cut. Also available as a plain text file at errors-and-warnings.txt inside the report directory.</p>
+<div class="card"><pre>
+[WARNING] Found 26 Warning event(s) with lastTimestamp inside the requested 60-minute window (of 231 total events currently retained by the API server).
+[ERROR] Deployment backend/backend-api READY=0 DESIRED=2.
+[ERROR] Deployment backend/backend-worker READY=0 DESIRED=1.
+[WARNING] Service backend/backend-api-svc (ClusterIP 10.43.54.78) is partially degraded -- ready: 10.42.0.14(backend-api-64bb4fb7c-lh7wz)  | not-ready: 10.42.0.15(backend-api-64bb4fb7c-lpg2q) 
+[ERROR] Service backend/cache-svc (ClusterIP 10.43.94.37) has NO active endpoints (ready or not-ready).
+[WARNING] Pod backend/backend-api-64bb4fb7c-lh7wz is Running but not Ready (readiness probe likely failing).
+[WARNING] Container backend/backend-api-64bb4fb7c-lh7wz/api restarted 5 time(s). Last reason=Error exitCode=1 finishedAt=2026-09-25T21:24:57Z
+[ERROR] Errors found in backend/backend-api-64bb4fb7c-lh7wz/api logs (last 60m).
+
+Incident #1  (backend/backend-api-64bb4fb7c-lh7wz/api)
+  First observed : 2026-09-25T21:26:21.723071703Z
+  Last observed  : 2026-09-25T21:26:21.723071703Z
+  ------------------------------------------------------------
+2026-09-25T21:26:21.723071703Z fatal: missing required env var API_SECRET
+
+[WARNING] Pod backend/backend-api-64bb4fb7c-lpg2q is Running but not Ready (readiness probe likely failing).
+[WARNING] Container backend/backend-api-64bb4fb7c-lpg2q/api restarted 4 time(s). Last reason=Error exitCode=1 finishedAt=2026-09-25T21:24:05Z
+[ERROR] Errors found in backend/backend-api-64bb4fb7c-lpg2q/api logs (last 60m).
+
+Incident #1  (backend/backend-api-64bb4fb7c-lpg2q/api)
+  First observed : 2026-09-25T21:25:00.757047180Z
+  Last observed  : 2026-09-25T21:25:00.757047180Z
+  ------------------------------------------------------------
+2026-09-25T21:25:00.757047180Z fatal: missing required env var API_SECRET
+
+[ERROR] Pod backend/backend-worker-6b68fd9867-mdgn5 is Pending. (node=k3s-server)
+[ERROR] Errors found in backend/backend-worker-6b68fd9867-mdgn5/worker logs (last 60m).
+
+Incident #1  (backend/backend-worker-6b68fd9867-mdgn5/worker)
+  First observed : Error
+  Last observed  : Error
+  ------------------------------------------------------------
+Error from server (BadRequest): container "worker" in pod "backend-worker-6b68fd9867-mdgn5" is waiting to start: CreateContainerConfigError
+
+[ERROR] Deployment database/database-backup-agent READY=0 DESIRED=1.
+[ERROR] StatefulSet database/database-primary READY=0 DESIRED=1.
+[ERROR] Service database/database-primary-svc (ClusterIP None) has endpoints but NONE are Ready: 10.42.0.17(database-primary-0) 
+[ERROR] Pod database/database-backup-agent-8c8f84bd7-dnbdr is Pending. (node=)
+[WARNING] Pod database/database-primary-0 is Running but not Ready (readiness probe likely failing).
+[WARNING] Container database/database-primary-0/postgres restarted 4 time(s). Last reason=OOMKilled exitCode=137 finishedAt=2026-09-25T21:25:20Z
+[CRITICAL] Container database/database-primary-0/postgres was OOMKilled (exitCode=137, finishedAt=2026-09-25T21:25:20Z).
+[ERROR] Deployment frontend/frontend-gateway READY=0 DESIRED=2.
+[ERROR] Deployment frontend/frontend-slow-start READY=0 DESIRED=1.
+[ERROR] Deployment frontend/frontend-web READY=0 DESIRED=3.
+[ERROR] Service frontend/frontend-gateway-svc (ClusterIP 10.43.8.171) has endpoints but NONE are Ready: 10.42.0.19(frontend-gateway-56b58445d9-j4s2t) 10.42.0.18(frontend-gateway-56b58445d9-zsmlb) 
+[ERROR] Service frontend/frontend-web-svc (ClusterIP 10.43.222.100) has endpoints but NONE are Ready: 10.42.0.11(frontend-web-7b486bd884-v866q) 10.42.0.12(frontend-web-7b486bd884-j44kx) 10.42.0.10(frontend-web-7b486bd884-nqmnp) 
+[WARNING] Pod frontend/frontend-gateway-56b58445d9-j4s2t is Running but not Ready (readiness probe likely failing).
+[WARNING] Pod frontend/frontend-gateway-56b58445d9-zsmlb is Running but not Ready (readiness probe likely failing).
+[WARNING] Pod frontend/frontend-slow-start-b44b8d558-j7xm7 is Running but not Ready (readiness probe likely failing).
+[WARNING] Container frontend/frontend-slow-start-b44b8d558-j7xm7/app restarted 4 time(s). Last reason=Error exitCode=137 finishedAt=2026-09-25T21:26:15Z
+[ERROR] Pod frontend/frontend-web-7b486bd884-j44kx is Pending. (node=k3s-server)
+[ERROR] Errors found in frontend/frontend-web-7b486bd884-j44kx/web logs (last 60m).
+
+Incident #1  (frontend/frontend-web-7b486bd884-j44kx/web)
+  First observed : Error
+  Last observed  : Error
+  ------------------------------------------------------------
+Error from server (BadRequest): container "web" in pod "frontend-web-7b486bd884-j44kx" is waiting to start: trying and failing to pull image
+
+[ERROR] Pod frontend/frontend-web-7b486bd884-nqmnp is Pending. (node=k3s-server)
+[ERROR] Errors found in frontend/frontend-web-7b486bd884-nqmnp/web logs (last 60m).
+
+Incident #1  (frontend/frontend-web-7b486bd884-nqmnp/web)
+  First observed : Error
+  Last observed  : Error
+  ------------------------------------------------------------
+Error from server (BadRequest): container "web" in pod "frontend-web-7b486bd884-nqmnp" is waiting to start: trying and failing to pull image
+
+[ERROR] Pod frontend/frontend-web-7b486bd884-v866q is Pending. (node=k3s-server)
+[ERROR] Errors found in frontend/frontend-web-7b486bd884-v866q/web logs (last 60m).
+
+Incident #1  (frontend/frontend-web-7b486bd884-v866q/web)
+  First observed : Error
+  Last observed  : Error
+  ------------------------------------------------------------
+Error from server (BadRequest): container "web" in pod "frontend-web-7b486bd884-v866q" is waiting to start: trying and failing to pull image
+
+[ERROR] Errors found in kube-system/helm-install-gateway-api-crd-ft8l9/helm logs (last 60m).
+
+Incident #1  (kube-system/helm-install-gateway-api-crd-ft8l9/helm)
+  First observed : 2026-09-25T21:06:18.398383972Z
+  Last observed  : 2026-09-25T21:06:18.398383972Z
+  ------------------------------------------------------------
+2026-09-25T21:06:18.398383972Z Error: no repositories configured
+
+
+Incident #2  (kube-system/helm-install-gateway-api-crd-ft8l9/helm)
+  First observed : 2026-09-25T21:06:18.848439387Z
+  Last observed  : 2026-09-25T21:06:18.848439387Z
+  ------------------------------------------------------------
+2026-09-25T21:06:18.848439387Z Error: release: not found
+
+[ERROR] Errors found in kube-system/helm-install-traefik-crd-zhp8g/helm logs (last 60m).
+
+Incident #1  (kube-system/helm-install-traefik-crd-zhp8g/helm)
+  First observed : 2026-09-25T21:06:15.582770970Z
+  Last observed  : 2026-09-25T21:06:15.582770970Z
+  ------------------------------------------------------------
+2026-09-25T21:06:15.582770970Z Error: no repositories configured
+
+
+Incident #2  (kube-system/helm-install-traefik-crd-zhp8g/helm)
+  First observed : 2026-09-25T21:06:15.846424937Z
+  Last observed  : 2026-09-25T21:06:15.846424937Z
+  ------------------------------------------------------------
+2026-09-25T21:06:15.846424937Z Error: release: not found
+
+[WARNING] Container kube-system/helm-install-traefik-dp2v2/helm restarted 1 time(s). Last reason=Error exitCode=1 finishedAt=2026-09-25T21:06:17Z
+[ERROR] Errors found in kube-system/helm-install-traefik-dp2v2/helm logs (last 60m).
+
+Incident #1  (kube-system/helm-install-traefik-dp2v2/helm)
+  First observed : 2026-09-25T21:06:18.113161621Z
+  Last observed  : 2026-09-25T21:06:18.113161621Z
+  ------------------------------------------------------------
+2026-09-25T21:06:18.113161621Z Error: no repositories configured
+
+
+Incident #2  (kube-system/helm-install-traefik-dp2v2/helm)
+  First observed : 2026-09-25T21:06:18.342373183Z
+  Last observed  : 2026-09-25T21:06:18.342373183Z
+  ------------------------------------------------------------
+2026-09-25T21:06:18.342373183Z Error: release: not found
+
+[ERROR] Errors found in kube-system/metrics-server-778c4649b4-swksk/metrics-server logs (last 60m).
+
+Incident #1  (kube-system/metrics-server-778c4649b4-swksk/metrics-server)
+  First observed : 2026-09-25T21:06:17.664917835Z
+  Last observed  : 2026-09-25T21:06:17.664917835Z
+  ------------------------------------------------------------
+2026-09-25T21:06:17.664917835Z I0925 21:06:17.664085       1 tlsconfig.go:243] "Starting DynamicServingCertificateController"
+
+
+Incident #2  (kube-system/metrics-server-778c4649b4-swksk/metrics-server)
+  First observed : 2026-09-25T21:06:17.831440439Z
+  Last observed  : 2026-09-25T21:06:17.831440439Z
+  ------------------------------------------------------------
+2026-09-25T21:06:17.831440439Z I0925 21:06:17.831129       1 server.go:192] "Failed probe" probe="metric-storage-ready" err="no metrics to serve"
+
+
+Incident #3  (kube-system/metrics-server-778c4649b4-swksk/metrics-server)
+  First observed : 2026-09-25T21:06:18.832232632Z
+  Last observed  : 2026-09-25T21:06:18.832232632Z
+  ------------------------------------------------------------
+2026-09-25T21:06:18.832232632Z I0925 21:06:18.831680       1 server.go:192] "Failed probe" probe="metric-storage-ready" err="no metrics to serve"
+
+
+Incident #4  (kube-system/metrics-server-778c4649b4-swksk/metrics-server)
+  First observed : 2026-09-25T21:06:20.949297825Z
+  Last observed  : 2026-09-25T21:06:20.949297825Z
+  ------------------------------------------------------------
+2026-09-25T21:06:20.949297825Z I0925 21:06:20.949079       1 server.go:192] "Failed probe" probe="metric-storage-ready" err="no metrics to serve"
+
+
+Incident #5  (kube-system/metrics-server-778c4649b4-swksk/metrics-server)
+  First observed : 2026-09-25T21:06:22.834667697Z
+  Last observed  : 2026-09-25T21:06:22.834667697Z
+  ------------------------------------------------------------
+2026-09-25T21:06:22.834667697Z I0925 21:06:22.834334       1 server.go:192] "Failed probe" probe="metric-storage-ready" err="no metrics to serve"
+
+
+Incident #6  (kube-system/metrics-server-778c4649b4-swksk/metrics-server)
+  First observed : 2026-09-25T21:06:24.832708765Z
+  Last observed  : 2026-09-25T21:06:24.832708765Z
+  ------------------------------------------------------------
+2026-09-25T21:06:24.832708765Z I0925 21:06:24.832601       1 server.go:192] "Failed probe" probe="metric-storage-ready" err="no metrics to serve"
+
+
+Incident #7  (kube-system/metrics-server-778c4649b4-swksk/metrics-server)
+  First observed : 2026-09-25T21:06:26.830640268Z
+  Last observed  : 2026-09-25T21:06:26.830640268Z
+  ------------------------------------------------------------
+2026-09-25T21:06:26.830640268Z I0925 21:06:26.830522       1 server.go:192] "Failed probe" probe="metric-storage-ready" err="no metrics to serve"
+
+
+Incident #8  (kube-system/metrics-server-778c4649b4-swksk/metrics-server)
+  First observed : 2026-09-25T21:06:28.830892785Z
+  Last observed  : 2026-09-25T21:06:28.830892785Z
+  ------------------------------------------------------------
+2026-09-25T21:06:28.830892785Z I0925 21:06:28.830714       1 server.go:192] "Failed probe" probe="metric-storage-ready" err="no metrics to serve"
+
+
+Incident #9  (kube-system/metrics-server-778c4649b4-swksk/metrics-server)
+  First observed : 2026-09-25T21:06:30.831642746Z
+  Last observed  : 2026-09-25T21:06:30.831642746Z
+  ------------------------------------------------------------
+2026-09-25T21:06:30.831642746Z I0925 21:06:30.831445       1 server.go:192] "Failed probe" probe="metric-storage-ready" err="no metrics to serve"
+
+[WARNING] PVCs not in Bound state detected.
+database   database-backup-pvc   Pending                     fast-ssd-premium   &lt;unset&gt;   4m2s
+</pre></div>
+<h2>Recommended Investigation Commands (none executed)</h2><div class="card"><pre>
+Node OS-level history (kubelet/kernel/containerd journal for the last 60 min)
+cannot be retrieved via the Kubernetes API alone. If needed, on the node itself run:
+  journalctl -u kubelet --since "60 minutes ago"
+kubectl describe deployment backend-api -n backend
+kubectl describe deployment backend-worker -n backend
+kubectl describe svc cache-svc -n backend
+kubectl get endpointslices -n backend -l kubernetes.io/service-name=cache-svc
+kubectl get pods -n backend --show-labels
+kubectl logs backend-api-64bb4fb7c-lh7wz -n backend -c api --previous --timestamps
+kubectl logs backend-api-64bb4fb7c-lh7wz -n backend -c api --since=60m --timestamps
+kubectl logs backend-api-64bb4fb7c-lpg2q -n backend -c api --previous --timestamps
+kubectl logs backend-api-64bb4fb7c-lpg2q -n backend -c api --since=60m --timestamps
+kubectl describe pod backend-worker-6b68fd9867-mdgn5 -n backend
+kubectl logs backend-worker-6b68fd9867-mdgn5 -n backend -c worker --since=60m --timestamps
+kubectl describe deployment database-backup-agent -n database
+kubectl describe statefulset database-primary -n database
+kubectl describe svc database-primary-svc -n database
+kubectl get endpointslices -n database -l kubernetes.io/service-name=database-primary-svc -o wide
+kubectl describe pod database-backup-agent-8c8f84bd7-dnbdr -n database
+kubectl logs database-primary-0 -n database -c postgres --previous --timestamps
+kubectl top pod database-primary-0 -n database
+kubectl get pod database-primary-0 -n database -o yaml   # review resources.limits
+kubectl describe deployment frontend-gateway -n frontend
+kubectl describe deployment frontend-slow-start -n frontend
+kubectl describe deployment frontend-web -n frontend
+kubectl describe svc frontend-gateway-svc -n frontend
+kubectl get endpointslices -n frontend -l kubernetes.io/service-name=frontend-gateway-svc -o wide
+kubectl describe svc frontend-web-svc -n frontend
+kubectl get endpointslices -n frontend -l kubernetes.io/service-name=frontend-web-svc -o wide
+kubectl logs frontend-slow-start-b44b8d558-j7xm7 -n frontend -c app --previous --timestamps
+kubectl describe pod frontend-web-7b486bd884-j44kx -n frontend
+kubectl logs frontend-web-7b486bd884-j44kx -n frontend -c web --since=60m --timestamps
+kubectl describe pod frontend-web-7b486bd884-nqmnp -n frontend
+kubectl logs frontend-web-7b486bd884-nqmnp -n frontend -c web --since=60m --timestamps
+kubectl describe pod frontend-web-7b486bd884-v866q -n frontend
+kubectl logs frontend-web-7b486bd884-v866q -n frontend -c web --since=60m --timestamps
+kubectl logs helm-install-gateway-api-crd-ft8l9 -n kube-system -c helm --since=60m --timestamps
+kubectl logs helm-install-traefik-crd-zhp8g -n kube-system -c helm --since=60m --timestamps
+kubectl logs helm-install-traefik-dp2v2 -n kube-system -c helm --previous --timestamps
+kubectl logs helm-install-traefik-dp2v2 -n kube-system -c helm --since=60m --timestamps
+kubectl logs metrics-server-778c4649b4-swksk -n kube-system -c metrics-server --since=60m --timestamps
+
+====================================================================
+GENERAL READ-ONLY TROUBLESHOOTING COMMANDS (none executed by scanner)
+====================================================================
+kubectl describe node &lt;node&gt;
+kubectl describe pod &lt;pod&gt; -n &lt;namespace&gt;
+kubectl logs &lt;pod&gt; -n &lt;namespace&gt; -c &lt;container&gt; --since=1h --timestamps
+kubectl logs &lt;pod&gt; -n &lt;namespace&gt; -c &lt;container&gt; --previous --timestamps
+kubectl describe svc &lt;service&gt; -n &lt;namespace&gt;
+kubectl get endpoints &lt;service&gt; -n &lt;namespace&gt;
+kubectl get endpointslices -n &lt;namespace&gt;
+kubectl get networkpolicy -A
+kubectl top nodes
+kubectl top pods -A
+kubectl get pvc -A
+====================================================================
+IMPORTANT: This scanner is diagnostic only. It never executes
+remediation, restarts, scaling, or any state-changing command.
+====================================================================
+</pre></div>
+<h2>Safety Confirmation</h2>
+<div class="card"><pre>
+Kubernetes resources modified/created/deleted : NO
+Pods restarted / nodes drained or cordoned    : NO
+kubectl exec diagnostics enabled              : NO (default off)
+Endpoint GET probes issued (opt-in)           : NO (default off)
+F5/external log hook executed (opt-in)        : NO
+Automatic remediation                         : NEVER
+Public internet access required               : NO (still requires connectivity to the Kubernetes API server via kubeconfig)
+Report written locally to                     : k8s-incident-report-20260925-212615/
+</pre></div>
+
+<h2>Coverage Limitations</h2>
+<div class="card"><pre>
+24h application/container logs   : available via --since=60m
+Kubernetes Events                : subject to cluster's event retention window
+24h kubelet / kernel / node logs : NOT available via Kubernetes API alone (needs node/SSH or external logging)
+Network blocking (NetworkPolicy) : evidence only (endpoints/logs), not packet-level proof
+F5 / external LB / WAF           : NOT visible to this scanner directly -- only via the pluggable F5_LOG_SOURCE / F5_LOG_HOOK hook (opt-in, off unless configured)
+Endpoint probe reachability      : when enabled, probes are loopback-only (inside the pod's own container) -- proves the app answers locally, not that other pods/nodes/NetworkPolicy allow reaching it
+</pre></div>
+
+<div style="text-align:center;color:#5a5f6a;font-size:12px;margin:30px 0 10px">
+Kubernetes Incident Diagnostic Scanner -- developed by Shady Gomaa
+</div>
+
+</body></html>

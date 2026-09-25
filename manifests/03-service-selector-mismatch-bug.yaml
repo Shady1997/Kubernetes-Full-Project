@@ -1,0 +1,39 @@
+# BUG #3: Service selector mismatch -> Service has zero Endpoints
+# Pods are healthy and Running, but the Service selector "app: cache-worker"
+# does not match the pod label "app: cache-wrkr" (typo).
+# Symptom: `kubectl get endpoints cache-svc -n backend` shows <none>.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cache-worker
+  namespace: backend
+  labels:
+    app: cache-wrkr
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cache-wrkr
+  template:
+    metadata:
+      labels:
+        app: cache-wrkr
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - containerPort: 6379
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cache-svc
+  namespace: backend
+spec:
+  selector:
+    app: cache-worker    # typo: pods are labeled "cache-wrkr"
+  ports:
+    - port: 6379
+      targetPort: 6379
+  type: ClusterIP
