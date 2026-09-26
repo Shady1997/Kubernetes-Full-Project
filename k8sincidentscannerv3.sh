@@ -796,8 +796,20 @@ for NS in $NAMESPACE_LIST; do
 
         READY_COND=$(kubectl get pod "$POD" -n "$NS" -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.status}{end}' 2>/dev/null)
         if [ "$READY_COND" = "False" ] && [ "$POD_STATUS" = "Running" ]; then
-            warn "Pod $NS/$POD is Running but not Ready (readiness probe likely failing)."
-            record_fact 40 READINESS_FAIL "$NS" "$POD" "developer" "Running but Ready=False -- readiness probe failing, pod is excluded from Service endpoints"
+            # Don't presume a readinessProbe exists and is "failing" -- a
+            # Running-but-not-Ready pod is just as often a container that
+            # hasn't finished starting, or one with NO readinessProbe at
+            # all still cycling through restarts, as it is an actual probe
+            # misconfiguration. Check for a defined readinessProbe on any
+            # container before wording it either way.
+            HAS_READINESS_PROBE=$(kubectl get pod "$POD" -n "$NS" -o jsonpath='{range .spec.containers[*]}{.readinessProbe}{end}' 2>/dev/null)
+            if [ -n "$HAS_READINESS_PROBE" ]; then
+                warn "Pod $NS/$POD is Running but not Ready (a readinessProbe is defined and is failing)."
+                record_fact 40 READINESS_FAIL "$NS" "$POD" "developer" "Running but Ready=False with a readinessProbe defined -- the probe itself is failing; pod is excluded from Service endpoints"
+            else
+                warn "Pod $NS/$POD is Running but not Ready (no readinessProbe is defined -- likely still starting up or cycling through restarts, not a probe failure)."
+                record_fact 40 READINESS_FAIL "$NS" "$POD" "developer" "Running but Ready=False with NO readinessProbe defined -- check container startup/restart state (e.g. CrashLoopBackOff, OOM) rather than probe config; pod is excluded from Service endpoints"
+            fi
         fi
 
         # CONFIRMED_REDIS requires strong evidence (image contains redis/valkey,
@@ -1146,6 +1158,69 @@ suggest_cmds() {
 
 html_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 
+###############################################################################
+# WORKLOAD RESOLUTION -- fixes namespace-level over-grouping in root-cause
+# correlation. Previously, every fact in a namespace was bucketed together
+# regardless of which actual Deployment/StatefulSet/Job it belonged to, so
+# a namespace with several unrelated simultaneous incidents would show one
+# as the "root cause" and nest the others underneath it as if related, even
+# with no causal link. This resolves each pod-level fact to its real owning
+# workload (via ownerReferences: Pod -> ReplicaSet -> Deployment, or Pod ->
+# StatefulSet/Job/DaemonSet directly) and each service-level fact to the
+# workload behind one of its actual endpoint pods -- so unrelated incidents
+# in the same namespace are correctly kept in separate candidates. A
+# Service with ZERO endpoints has no pod to resolve from, so it correctly
+# stays its own isolated group rather than being merged into anything --
+# that absence of endpoints IS the finding.
+#
+# Read-only: only `kubectl get` calls, cached per pod so repeat facts about
+# the same pod don't re-query the API.
+###############################################################################
+declare -A WORKLOAD_CACHE
+resolve_workload() {
+    # $1 ns  $2 pod  -> prints the owning workload name (Deployment/
+    # StatefulSet/Job/DaemonSet), or the pod's own name if unresolvable.
+    local ns="$1" pod="$2" cache_key="${1}/${2}"
+    if [ -n "${WORKLOAD_CACHE[$cache_key]+set}" ]; then
+        echo "${WORKLOAD_CACHE[$cache_key]}"
+        return
+    fi
+    local kind name result
+    kind=$(kubectl get pod "$pod" -n "$ns" -o jsonpath='{.metadata.ownerReferences[0].kind}' 2>/dev/null)
+    name=$(kubectl get pod "$pod" -n "$ns" -o jsonpath='{.metadata.ownerReferences[0].name}' 2>/dev/null)
+    if [ "$kind" = "ReplicaSet" ] && [ -n "$name" ]; then
+        local deploy
+        deploy=$(kubectl get replicaset "$name" -n "$ns" -o jsonpath='{.metadata.ownerReferences[0].name}' 2>/dev/null)
+        result="${deploy:-$name}"
+    elif [ -n "$name" ]; then
+        result="$name"
+    else
+        result="$pod"
+    fi
+    WORKLOAD_CACHE[$cache_key]="$result"
+    echo "$result"
+}
+
+resolve_service_workload() {
+    # $1 ns  $2 svc  -> resolves via one of the service's own endpoint pods
+    # (already recorded in service-topology.tsv), so no extra selector
+    # matching is needed. Falls back to an isolated "svc:<name>" group key
+    # when the service has no endpoint pod to resolve from at all.
+    local ns="$1" svc="$2" row podlist first_pod
+    row=$(awk -F'\t' -v ns="$ns" -v svc="$svc" '$1==ns && $2==svc' "$REPORT_DIR/data/service-topology.tsv" 2>/dev/null | head -1)
+    if [ -z "$row" ]; then
+        echo "svc:$svc"
+        return
+    fi
+    podlist=$(echo "$row" | awk -F'\t' '{print $4" "$5}')
+    first_pod=$(echo "$podlist" | grep -oE '\([^)]+\)' | head -1 | tr -d '()')
+    if [ -n "$first_pod" ]; then
+        resolve_workload "$ns" "$first_pod"
+    else
+        echo "svc:$svc"
+    fi
+}
+
 ROOT_CAUSE_COUNT=0
 
 # --- Cluster/node-wide facts (namespace field is "-") ---
@@ -1179,24 +1254,37 @@ if [ -n "$CLUSTER_FACTS" ]; then
     } >> "$ROOTCAUSE_HTML"
 fi
 
-# --- Per-namespace facts ---
-NS_FACTS_SORTED="$REPORT_DIR/data/ns_facts_sorted.tmp"
-awk -F'\t' '$3!="-"' "$FACTS_FILE" | sort -t$'\t' -k3,3 -k1,1n > "$NS_FACTS_SORTED"
+# --- Per-namespace facts, grouped by resolved owning workload ---
+GROUPED_FACTS="$REPORT_DIR/data/grouped_facts.tsv"
+: > "$GROUPED_FACTS"
 
-NS_UNIQUE=$(cut -f3 "$NS_FACTS_SORTED" | sort -u)
+awk -F'\t' '$3!="-"' "$FACTS_FILE" | while IFS=$'\t' read -r rank cat ns res owner detail ts; do
+    [ -z "$rank" ] && continue
+    case "$cat" in
+        NO_ENDPOINTS|PARTIAL_NOT_READY)
+            GKEY=$(resolve_service_workload "$ns" "$res")
+            ;;
+        *)
+            GKEY=$(resolve_workload "$ns" "${res%%/*}")
+            ;;
+    esac
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$GKEY" "$rank" "$cat" "$ns" "$res" "$owner" "$detail" "$ts" >> "$GROUPED_FACTS"
+done
 
-for NS in $NS_UNIQUE; do
+NS_GROUP_PAIRS=$(awk -F'\t' '{print $4"\t"$1}' "$GROUPED_FACTS" | sort -u -t$'\t' -k1,1 -k2,2)
+
+while IFS=$'\t' read -r NS GKEY; do
     [ -z "$NS" ] && continue
-    NS_FACTS=$(awk -F'\t' -v ns="$NS" '$3==ns' "$NS_FACTS_SORTED")
-    ROOT=$(echo "$NS_FACTS" | head -1)
-    REST=$(echo "$NS_FACTS" | tail -n +2)
+    GROUP_FACTS=$(awk -F'\t' -v ns="$NS" -v gk="$GKEY" '$4==ns && $1==gk' "$GROUPED_FACTS" | sort -t$'\t' -k2,2n)
+    ROOT=$(echo "$GROUP_FACTS" | head -1)
+    REST=$(echo "$GROUP_FACTS" | tail -n +2)
 
-    RANK=$(echo "$ROOT" | cut -f1); CAT=$(echo "$ROOT" | cut -f2); RES=$(echo "$ROOT" | cut -f4); OWNER=$(echo "$ROOT" | cut -f5); DETAIL=$(echo "$ROOT" | cut -f6)
+    RANK=$(echo "$ROOT" | cut -f2); CAT=$(echo "$ROOT" | cut -f3); RES=$(echo "$ROOT" | cut -f5); OWNER=$(echo "$ROOT" | cut -f6); DETAIL=$(echo "$ROOT" | cut -f7)
     ROOT_CAUSE_COUNT=$((ROOT_CAUSE_COUNT+1))
 
     {
         echo "============================================================"
-        echo "ROOT-CAUSE CANDIDATE / INVESTIGATION LEAD #$ROOT_CAUSE_COUNT  (namespace: $NS)"
+        echo "ROOT-CAUSE CANDIDATE / INVESTIGATION LEAD #$ROOT_CAUSE_COUNT  (namespace: $NS, workload: $GKEY)"
         echo "============================================================"
         echo "Category : $CAT"
         echo "Resource : $NS/$RES"
@@ -1204,8 +1292,8 @@ for NS in $NS_UNIQUE; do
         echo "Evidence : $DETAIL"
         echo ""
         if [ -n "$REST" ]; then
-            echo "Related evidence in the same namespace (likely downstream symptoms):"
-            echo "$REST" | while IFS=$'\t' read -r r c n res2 o d; do
+            echo "Related evidence for the SAME workload ($GKEY) -- likely part of the same incident:"
+            echo "$REST" | while IFS=$'\t' read -r gk2 r c n res2 o d ts2; do
                 echo "  - [$c] $n/$res2: $d"
             done
         fi
@@ -1216,26 +1304,24 @@ for NS in $NS_UNIQUE; do
     } >> "$ROOTCAUSE_REPORT"
 
     {
-        echo "<div class=\"card\"><h3>Root-Cause Candidate / Investigation Lead #$ROOT_CAUSE_COUNT <span class=\"badge err\">ns: $(echo "$NS" | html_escape)</span></h3>"
+        echo "<div class=\"card\"><h3>Root-Cause Candidate / Investigation Lead #$ROOT_CAUSE_COUNT <span class=\"badge err\">ns: $(echo "$NS" | html_escape) &middot; workload: $(echo "$GKEY" | html_escape)</span></h3>"
         echo "<p><b>Category:</b> $(echo "$CAT" | html_escape)<br><b>Resource:</b> $(echo "$NS/$RES" | html_escape)<br><b>Likely owner:</b> $(owner_label "$OWNER" | html_escape)</p>"
         echo "<p><b>Evidence:</b> $(echo "$DETAIL" | html_escape)</p>"
         if [ -n "$REST" ]; then
-            echo "<p><b>Related evidence (likely downstream symptoms):</b></p><pre>"
-            echo "$REST" | while IFS=$'\t' read -r r c n res2 o d; do
+            echo "<p><b>Related evidence for the same workload</b> (likely part of the same incident, not a separate one):</p><pre>"
+            echo "$REST" | while IFS=$'\t' read -r gk2 r c n res2 o d ts2; do
                 echo "[$c] $n/$res2: $d"
             done | html_escape
             echo "</pre>"
         fi
         echo "<p><b>Suggested commands (read-only):</b></p><pre>$(suggest_cmds "$CAT" "$NS" "$RES" | tr '|' '\n' | html_escape)</pre></div>"
     } >> "$ROOTCAUSE_HTML"
-done
+done <<< "$NS_GROUP_PAIRS"
 
 if [ "$ROOT_CAUSE_COUNT" -eq 0 ]; then
     echo "No correlated findings in this scan window -- no root-cause candidates identified." >> "$ROOTCAUSE_REPORT"
     echo "<div class=\"card\">No correlated findings in this scan window.</div>" >> "$ROOTCAUSE_HTML"
 fi
-
-rm -f "$NS_FACTS_SORTED"
 
 echo "Root cause candidates identified: $ROOT_CAUSE_COUNT"
 
@@ -1587,7 +1673,7 @@ Network blocking (NetworkPolicy) : evidence only (endpoints/logs), not packet-le
 F5 / external LB / WAF           : NOT visible to this scanner directly -- only via the pluggable F5_LOG_SOURCE / F5_LOG_HOOK hook (opt-in, off unless configured)
 Endpoint probe reachability      : when enabled, probes are loopback-only (inside the pod's own container) -- proves the app answers locally, not that other pods/nodes/NetworkPolicy allow reaching it
 Snapshot timing                  : each check is a separate live kubectl call made a moment apart, not one atomic snapshot -- during a rapidly changing/flapping incident, two sections of the same report (e.g. Service Topology vs a pod's own Ready condition) can reflect slightly different instants and may appear to disagree. Trust the most specific, most recent evidence (a pod's own Ready condition, live logs) over aggregate summaries when investigating something actively flapping.
-Root-cause grouping               : candidates are grouped by namespace and ranked by category, not by owning workload/selector -- in a namespace with multiple unrelated incidents at once, genuinely separate problems (e.g. one service with zero endpoints, and a different, unrelated deployment crash-looping) can be shown as one candidate's "related evidence" even when there is no causal link between them. Read the Evidence field for the actual root-cause candidate itself; treat "related evidence" as other findings in the same namespace, not necessarily the same incident.
+Root-cause grouping               : candidates are grouped by the resolved owning workload (Deployment/StatefulSet/Job, via ownerReferences), not just by namespace, so unrelated incidents in the same namespace are kept as separate candidates. Remaining edge cases: a bare pod with no owner reference is its own group; a Service with endpoints is grouped with the workload behind those endpoints; a Service with ZERO endpoints has no pod to resolve from and is intentionally left isolated (that absence is itself the finding). Two genuinely distinct workloads that happen to share an identical name across different resource kinds in the same namespace are a residual, unlikely edge case not disambiguated further.
 </pre></div>
 
 <div style="text-align:center;color:#5a5f6a;font-size:12px;margin:30px 0 10px">
