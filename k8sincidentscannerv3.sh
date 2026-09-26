@@ -36,18 +36,18 @@
 # and does not execute anything against F5. See section "F5 / EXTERNAL
 # LOAD BALANCER" below.
 #
+# LIVE LOG VIEWER: before the scan prompts, the script offers to just
+# `kubectl logs -f` one chosen pod instead of running a scan at all. Same
+# read-only category as every other `logs` call here -- it only reads a
+# stream, changes nothing -- and it exits (no scan, no report) once you
+# stop watching. See "LIVE LOG VIEWER" below.
+#
 # It requires NO public internet access -- only connectivity to your
 # Kubernetes API server via the existing kubeconfig, and writes report
 # files locally.
 ###############################################################################
 
 set +e
-
-###############################################################################
-# 0. INTERACTIVE INPUT: SCAN WINDOW + SEARCH FILTER
-###############################################################################
-
-DEFAULT_MINUTES=1440   # 24 hours
 
 echo "============================================================"
 echo " KUBERNETES INCIDENT DIAGNOSTIC SCANNER v2"
@@ -58,6 +58,99 @@ echo ""
 echo "No internet connection is required."
 echo "No Kubernetes resources will be modified."
 echo ""
+
+###############################################################################
+# LIVE LOG VIEWER (optional, read-only, exits after use)
+#
+# Before running a full scan, offer a shortcut: just tail one pod's logs
+# live (kubectl logs -f) instead of a full scan. Useful when you already
+# know which pod is acting up and just want to watch it right now. This
+# does not run the scan or produce a report -- it exits when you stop
+# watching (Ctrl+C) or the log stream ends.
+#
+# Still strictly read-only: `kubectl logs -f` only reads a log stream,
+# same category as every other `logs` call this scanner already makes --
+# it changes nothing in the cluster.
+###############################################################################
+
+LIVE_LOGS_POD="${LIVE_LOGS_POD:-}"   # optional non-interactive "namespace/podname" override
+WANT_LIVE_LOGS="n"
+
+if [ -n "$LIVE_LOGS_POD" ]; then
+    WANT_LIVE_LOGS="y"
+elif [ -t 0 ]; then
+    read -r -p "Do you want to watch LIVE LOGS of a pod right now, instead of running a scan? [y/N]: " LIVE_LOGS_CHOICE
+    case "$LIVE_LOGS_CHOICE" in
+        [Yy]*) WANT_LIVE_LOGS="y" ;;
+        *) WANT_LIVE_LOGS="n" ;;
+    esac
+fi
+
+if [ "$WANT_LIVE_LOGS" = "y" ]; then
+    if [ -n "$LIVE_LOGS_POD" ]; then
+        LIVE_NS="${LIVE_LOGS_POD%%/*}"
+        LIVE_POD="${LIVE_LOGS_POD#*/}"
+    else
+        echo ""
+        echo "Discovering pods across all namespaces..."
+        LIVE_POD_DISCOVERY=$(kubectl get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"\n"}{end}' 2>/dev/null | sort)
+        if [ -z "$LIVE_POD_DISCOVERY" ]; then
+            echo "Could not list pods (cluster not reachable, or kubectl unavailable)."
+            echo "Continuing to the normal scan instead."
+            WANT_LIVE_LOGS="n"
+        else
+            LIVE_POD_ARRAY=()
+            while IFS= read -r live_p; do
+                [ -n "$live_p" ] && LIVE_POD_ARRAY+=("$live_p")
+            done <<< "$LIVE_POD_DISCOVERY"
+            echo ""
+            for i in "${!LIVE_POD_ARRAY[@]}"; do
+                printf "  %d. %s\n" "$((i+1))" "${LIVE_POD_ARRAY[$i]}"
+            done
+            echo ""
+            read -r -p "Enter the number of the pod to watch [Enter to cancel]: " LIVE_POD_NUM
+            case "$LIVE_POD_NUM" in
+                ''|*[!0-9]*)
+                    echo "No pod selected -- continuing to the normal scan instead."
+                    WANT_LIVE_LOGS="n"
+                    ;;
+                *)
+                    LIVE_IDX=$((LIVE_POD_NUM-1))
+                    if [ "$LIVE_IDX" -ge 0 ] && [ "$LIVE_IDX" -lt "${#LIVE_POD_ARRAY[@]}" ]; then
+                        LIVE_ENTRY="${LIVE_POD_ARRAY[$LIVE_IDX]}"
+                        LIVE_NS="${LIVE_ENTRY%%/*}"
+                        LIVE_POD="${LIVE_ENTRY#*/}"
+                    else
+                        echo "Invalid selection -- continuing to the normal scan instead."
+                        WANT_LIVE_LOGS="n"
+                    fi
+                    ;;
+            esac
+        fi
+    fi
+fi
+
+if [ "$WANT_LIVE_LOGS" = "y" ] && [ -n "${LIVE_NS:-}" ] && [ -n "${LIVE_POD:-}" ]; then
+    echo ""
+    echo "============================================================"
+    echo " LIVE LOGS: $LIVE_NS/$LIVE_POD  (read-only: kubectl logs -f)"
+    echo " Press Ctrl+C to stop watching. No scan will run."
+    echo "============================================================"
+    echo ""
+    trap 'echo ""; echo "Stopped watching logs. Exiting (no scan was run)."; exit 0' INT
+    kubectl logs -f -n "$LIVE_NS" "$LIVE_POD" --all-containers --timestamps
+    trap - INT
+    echo ""
+    echo "Log stream ended (pod may have restarted or the container exited). Exiting (no scan was run)."
+    exit 0
+fi
+
+###############################################################################
+# 0. INTERACTIVE INPUT: SCAN WINDOW + SEARCH FILTER
+###############################################################################
+
+DEFAULT_MINUTES=1440   # 24 hours
+
 echo "------------------------------------------------------------"
 echo "1. SCAN TIME WINDOW"
 echo "------------------------------------------------------------"
@@ -83,7 +176,71 @@ esac
 
 echo ""
 echo "------------------------------------------------------------"
-echo "2. TARGETED SEARCH (optional)"
+echo "2. SCAN SCOPE"
+echo "------------------------------------------------------------"
+echo "Scan the full infrastructure, or only specific pods?"
+echo ""
+
+# Allow non-interactive override via env var (for cron / CI use):
+# a comma- or space-separated list of literal "namespace/podname"
+# entries, or "all"/"full" to force a full scan without prompting.
+SCAN_PODS="${SCAN_PODS:-}"
+SELECTED_PODS=""
+SCOPE_MODE="FULL"
+
+if [ -n "$SCAN_PODS" ] && [ "$SCAN_PODS" != "all" ] && [ "$SCAN_PODS" != "full" ]; then
+    SELECTED_PODS=$(echo "$SCAN_PODS" | tr ',' ' ')
+    SCOPE_MODE="SELECTED"
+    echo "Scan scope set via SCAN_PODS env var: $SELECTED_PODS"
+elif [ -t 0 ]; then
+    read -r -p "Enter [F]ull infrastructure or [S]pecific pods [default: Full]: " SCOPE_CHOICE
+    case "$SCOPE_CHOICE" in
+        [Ss]*)
+            echo ""
+            echo "Discovering pods across all namespaces..."
+            POD_DISCOVERY=$(kubectl get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"\n"}{end}' 2>/dev/null | sort)
+            if [ -z "$POD_DISCOVERY" ]; then
+                echo "Could not list pods (cluster not reachable yet, or kubectl unavailable)."
+                echo "Defaulting to FULL SCAN -- connectivity will be verified in the next step."
+            else
+                POD_ARRAY=()
+                while IFS= read -r pod_entry; do
+                    [ -n "$pod_entry" ] && POD_ARRAY+=("$pod_entry")
+                done <<< "$POD_DISCOVERY"
+                echo ""
+                for i in "${!POD_ARRAY[@]}"; do
+                    printf "  %d. %s\n" "$((i+1))" "${POD_ARRAY[$i]}"
+                done
+                echo ""
+                read -r -p "Enter numbers to scan, comma-separated (e.g. 1,3) [default: Full scan]: " POD_SELECTION
+                if [ -n "$POD_SELECTION" ]; then
+                    PICKED=""
+                    IFS=',' read -ra POD_NUMS <<< "$POD_SELECTION"
+                    for n in "${POD_NUMS[@]}"; do
+                        n=$(echo "$n" | tr -d '[:space:]')
+                        case "$n" in ''|*[!0-9]*) continue ;; esac
+                        idx=$((n-1))
+                        if [ "$idx" -ge 0 ] && [ "$idx" -lt "${#POD_ARRAY[@]}" ]; then
+                            PICKED="$PICKED ${POD_ARRAY[$idx]}"
+                        fi
+                    done
+                    PICKED=$(echo "$PICKED" | sed 's/^ *//')
+                    if [ -n "$PICKED" ]; then
+                        SELECTED_PODS="$PICKED"
+                        SCOPE_MODE="SELECTED"
+                    else
+                        echo "No valid pod numbers recognized -- defaulting to FULL SCAN."
+                    fi
+                fi
+            fi
+            ;;
+        *) : ;;   # anything else (including empty) -> full scan, the default
+    esac
+fi
+
+echo ""
+echo "------------------------------------------------------------"
+echo "3. TARGETED SEARCH (optional)"
 echo "------------------------------------------------------------"
 echo "Enter an ID / IP / error string to search for (transaction ID,"
 echo "request ID, correlation ID, user ID, IP, exception name, etc)."
@@ -108,9 +265,10 @@ SCAN_END_HUMAN=$(date -d "@$SCAN_END_EPOCH" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || 
 
 echo ""
 echo "------------------------------------------------------------"
-echo "3. CONFIRM SCAN"
+echo "4. CONFIRM SCAN"
 echo "------------------------------------------------------------"
 echo "Time range : last ${SCAN_MINUTES} minutes (${SCAN_START_HUMAN} -> ${SCAN_END_HUMAN})"
+echo "Scope      : $([ "$SCOPE_MODE" = "SELECTED" ] && echo "Selected pods -${SELECTED_PODS}" || echo "Full infrastructure (all pods)")"
 echo "Search     : ${SEARCH_VALUE:-<none, full scan>}"
 echo "Mode       : ${SEARCH_MODE}"
 echo ""
@@ -205,7 +363,7 @@ F5_REPORT="$REPORT_DIR/data/f5-external.log"
 # RANK = how "upstream" this fact typically is (lower = more likely root
 # cause; higher = more likely a downstream symptom of something else):
 #   10 CONTROL_PLANE   20 NODE   30 DNS   35 REDIS   38 SECURITY
-#   40 NO_ENDPOINTS    45 OOM    50 RESTART   55 PENDING/FAILED
+#   40 NO_ENDPOINTS    45 OOM    50 RESTART   55 PENDING_SCHEDULING/PENDING_CONTAINER_ERROR/FAILED
 #   60 LOG_ERROR       70 HAPROXY_5XX (almost always a symptom, not a cause)
 #
 # OWNER values map to a team in owner_label(): infra, network, developer,
@@ -629,7 +787,27 @@ info "Events: $EVENTS_IN_WINDOW of $TOTAL_RETAINED_EVENTS currently-retained eve
 # 4. NAMESPACE / WORKLOAD SCAN
 ###############################################################################
 
-NAMESPACE_LIST=$(kubectl get namespaces -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+# When scope is SELECTED (specific pods chosen), only namespaces that
+# contain at least one selected pod are visited, and within each such
+# namespace only the selected pods get the deep per-pod scan (describe,
+# container status, restarts, OOM check, log scan). Deployment/
+# StatefulSet/Job/CronJob/Service checks still run for the WHOLE
+# namespace the pod lives in, not just the selected pod's own owner --
+# this is a deliberate choice: it gives real context (e.g. "is the
+# Service routing to this pod healthy?") at negligible extra cost,
+# without needing full ownerReference resolution up front.
+selected_pods_in_ns() {
+    # $1 = namespace -> prints the selected pod names in that namespace, one per line
+    local ns="$1"
+    echo "$SELECTED_PODS" | tr ' ' '\n' | awk -F'/' -v ns="$ns" '$1==ns {print $2}'
+}
+
+if [ "$SCOPE_MODE" = "SELECTED" ] && [ -n "$SELECTED_PODS" ]; then
+    NAMESPACE_LIST=$(echo "$SELECTED_PODS" | tr ' ' '\n' | awk -F'/' '{print $1}' | sort -u)
+    info "Scan scope restricted to selected pod(s): $SELECTED_PODS"
+else
+    NAMESPACE_LIST=$(kubectl get namespaces -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+fi
 
 REDIS_FOUND=0
 
@@ -772,6 +950,13 @@ for NS in $NAMESPACE_LIST; do
 
     # --- Pods ---
     POD_LIST=$(kubectl get pods -n "$NS" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
+    if [ "$SCOPE_MODE" = "SELECTED" ]; then
+        ALLOWED_PODS=$(selected_pods_in_ns "$NS")
+        POD_LIST=$(echo "$POD_LIST" | while read -r p; do
+            [ -z "$p" ] && continue
+            echo "$ALLOWED_PODS" | grep -qx "$p" && echo "$p"
+        done)
+    fi
 
     for POD in $POD_LIST; do
         POD_STATUS=$(kubectl get pod "$POD" -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null)
@@ -788,7 +973,29 @@ for NS in $NAMESPACE_LIST; do
 
         case "$POD_STATUS" in
             Running|Succeeded) ;;
-            Pending) error "Pod $NS/$POD is Pending. (node=$NODE_NAME)"; fix "kubectl describe pod $POD -n $NS"; record_fact 55 PENDING "$NS" "$POD" "infra-or-developer" "Pending on node=$NODE_NAME -- check scheduling/resource requests" ;;
+            Pending)
+                # A "Pending" phase means two very different things that
+                # need different fixes: the pod may still be unschedulable
+                # (no node fits -- resources, taints, unbound PVC), or it
+                # may already be scheduled to a node and stuck because a
+                # container can't start (bad image, missing ConfigMap/
+                # Secret). "kubectl top nodes"/"resourcequota" only helps
+                # the first case; conflating them under one PENDING
+                # category pointed the wrong commands at the wrong fix.
+                WAITING_REASON=$(kubectl get pod "$POD" -n "$NS" -o jsonpath='{range .status.containerStatuses[*]}{.state.waiting.reason}{" "}{end}' 2>/dev/null)
+                if [ -n "$NODE_NAME" ] && echo "$WAITING_REASON" | grep -Eqi 'ImagePullBackOff|ErrImagePull|InvalidImageName|CreateContainerConfigError|CreateContainerError'; then
+                    error "Pod $NS/$POD is Pending due to a container start error on node=$NODE_NAME (reason: $WAITING_REASON)."
+                    fix "kubectl describe pod $POD -n $NS   # check Events for the exact image/config/secret error"
+                    fix "kubectl get pod $POD -n $NS -o jsonpath='{.status.containerStatuses[*].state.waiting.message}'"
+                    record_fact 55 PENDING_CONTAINER_ERROR "$NS" "$POD" "developer" "Pending on node=$NODE_NAME due to a container start error ($WAITING_REASON) -- already scheduled fine; check the image reference, ConfigMap/Secret references, or registry credentials, not node capacity"
+                else
+                    error "Pod $NS/$POD is Pending. (node=${NODE_NAME:-<unscheduled>})"
+                    fix "kubectl describe pod $POD -n $NS"
+                    fix "kubectl top nodes"
+                    fix "kubectl get resourcequota -n $NS"
+                    record_fact 55 PENDING_SCHEDULING "$NS" "$POD" "infra-or-developer" "Pending, unscheduled or awaiting resources (node=${NODE_NAME:-none}) -- check node capacity, PVC binding, taints/affinity, or resource requests"
+                fi
+                ;;
             Failed)  error "Pod $NS/$POD is Failed. (node=$NODE_NAME)"; fix "kubectl logs $POD -n $NS --all-containers"; record_fact 55 FAILED "$NS" "$POD" "developer" "Pod Failed on node=$NODE_NAME" ;;
             Unknown) error "Pod $NS/$POD status is Unknown. (node=$NODE_NAME)"; record_fact 55 UNKNOWN "$NS" "$POD" "infra" "Pod status Unknown on node=$NODE_NAME -- possible node/kubelet issue" ;;
             *) [ -n "$POD_STATUS" ] && warn "Pod $NS/$POD has status $POD_STATUS." ;;
@@ -1143,7 +1350,8 @@ suggest_cmds() {
         READINESS_FAIL) echo "kubectl describe pod ${res%%/*} -n $ns|kubectl logs ${res%%/*} -n $ns --since=${SCAN_MINUTES}m" ;;
         OOM) echo "kubectl top pod ${res%%/*} -n $ns|kubectl get pod ${res%%/*} -n $ns -o yaml   # check resources.limits.memory" ;;
         RESTART) echo "kubectl logs ${res%%/*} -n $ns -c ${res##*/} --previous --timestamps|kubectl describe pod ${res%%/*} -n $ns" ;;
-        PENDING) echo "kubectl describe pod $res -n $ns|kubectl top nodes|kubectl get resourcequota -n $ns" ;;
+        PENDING_SCHEDULING) echo "kubectl describe pod $res -n $ns|kubectl top nodes|kubectl get resourcequota -n $ns|kubectl get pvc -n $ns" ;;
+        PENDING_CONTAINER_ERROR) echo "kubectl describe pod $res -n $ns   # check Events for the exact image/config/secret error|kubectl get pod $res -n $ns -o jsonpath='{.status.containerStatuses[*].state.waiting.message}'" ;;
         FAILED|UNKNOWN) echo "kubectl describe pod $res -n $ns|kubectl logs $res -n $ns --all-containers" ;;
         STATEFULSET_NOT_READY) echo "kubectl describe statefulset $res -n $ns|kubectl get pods -n $ns -l app=$res" ;;
         JOB_FAILED) echo "kubectl describe job $res -n $ns|kubectl logs -n $ns -l job-name=$res --all-containers --tail=200" ;;
@@ -1443,6 +1651,7 @@ FINAL SUMMARY
 ====================================================================
 Context        : $CURRENT_CONTEXT
 Scan window    : last ${SCAN_MINUTES} min ($SCAN_START_HUMAN -> $SCAN_END_HUMAN)
+Scope          : $([ "$SCOPE_MODE" = "SELECTED" ] && echo "Selected pods -${SELECTED_PODS}" || echo "Full infrastructure (all pods)")
 Search         : ${SEARCH_VALUE:-<full scan>}  (sources: $MATCHES, occurrences: $SEARCH_OCCURRENCES, resources: $SEARCH_RESOURCES, namespaces: $SEARCH_NAMESPACES)
 Control plane  : $CONTROL_PLANE_STATUS
 Redis          : $REDIS_STATUS
@@ -1479,6 +1688,7 @@ EOF
 # into HTML unescaped. ---
 HTML_CONTEXT=$(printf '%s' "$CURRENT_CONTEXT" | html_escape)
 HTML_SEARCH=$(printf '%s' "${SEARCH_VALUE:-Full scan}" | html_escape)
+HTML_SCOPE=$(printf '%s' "$([ "$SCOPE_MODE" = "SELECTED" ] && echo "Selected pods: ${SELECTED_PODS}" || echo "Full infrastructure")" | html_escape)
 
 # --- Build a self-contained HTML report ---
 {
@@ -1512,6 +1722,7 @@ table{font-size:13px} th{color:#9aa0aa;font-weight:600}
 <div class="grid">
 <div><div class="label">Context</div><div class="stat" style="font-size:16px">$HTML_CONTEXT</div></div>
 <div><div class="label">Scan window</div><div class="stat" style="font-size:16px">${SCAN_MINUTES} min</div></div>
+<div><div class="label">Scope</div><div class="stat" style="font-size:14px">$HTML_SCOPE</div></div>
 <div><div class="label">From</div><div class="stat" style="font-size:14px">$SCAN_START_HUMAN</div></div>
 <div><div class="label">To</div><div class="stat" style="font-size:14px">$SCAN_END_HUMAN</div></div>
 <div><div class="label">Search</div><div class="stat" style="font-size:14px">$HTML_SEARCH</div></div>
@@ -1690,6 +1901,7 @@ Developed by Shady Gomaa
 Context   : $CURRENT_CONTEXT
 Generated : $(timestamp)
 Window    : last ${SCAN_MINUTES} min ($SCAN_START_HUMAN -> $SCAN_END_HUMAN)
+Scope     : $([ "$SCOPE_MODE" = "SELECTED" ] && echo "Selected pods -${SELECTED_PODS}" || echo "Full infrastructure (all pods)")
 Search    : ${SEARCH_VALUE:-<full scan>}  (sources: $MATCHES, occurrences: $SEARCH_OCCURRENCES, resources: $SEARCH_RESOURCES, namespaces: $SEARCH_NAMESPACES)
 
 Open index.html in a browser for the visual report (fully offline, no
