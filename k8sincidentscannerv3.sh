@@ -310,6 +310,37 @@ F5_LOG_SOURCE="${F5_LOG_SOURCE:-}"
 F5_LOG_HOOK="${F5_LOG_HOOK:-}"
 F5_BLOCK_PATTERN="${F5_BLOCK_PATTERN:-blocking_exception_reason|support_id|violation_rating|asm.*block|tcp_rst|reset by peer|connection refused by big-?ip|no members available|pool.*monitor.*down|node.*monitor.*down|exceeded.*connection limit|irule.*(drop|reject)}"
 
+# --- Slowness / performance triage thresholds (all opt-out via env override,
+# all read-only checks -- see "API LATENCY", "ETCD HEALTH", node oversub in
+# section 2, and HPA STATUS in section 4). These give circumstantial
+# evidence toward common infra-side causes of "the app works but is slow";
+# they cannot diagnose a slow application request path itself (that needs
+# tracing/APM this scanner has no access to) -- see Coverage Limitations.
+API_LATENCY_WARN_MS="${API_LATENCY_WARN_MS:-1000}"
+API_LATENCY_CRIT_MS="${API_LATENCY_CRIT_MS:-3000}"
+NODE_CPU_WARN_PCT="${NODE_CPU_WARN_PCT:-75}"
+NODE_CPU_CRIT_PCT="${NODE_CPU_CRIT_PCT:-90}"
+NODE_MEM_WARN_PCT="${NODE_MEM_WARN_PCT:-75}"
+NODE_MEM_CRIT_PCT="${NODE_MEM_CRIT_PCT:-90}"
+POD_CPU_WARN_PCT="${POD_CPU_WARN_PCT:-80}"
+POD_CPU_CRIT_PCT="${POD_CPU_CRIT_PCT:-95}"
+POD_MEM_WARN_PCT="${POD_MEM_WARN_PCT:-80}"
+POD_MEM_CRIT_PCT="${POD_MEM_CRIT_PCT:-95}"
+
+# Millisecond-resolution wall clock without shelling out to `date` (whose
+# %N nanosecond format is GNU-only and silently breaks on macOS/BSD date).
+# $EPOCHREALTIME is a bash 5+ builtin (seconds.microseconds); falls back to
+# whole-second resolution on older bash, which is coarser but still
+# functional for flagging multi-second API latency.
+now_ms() {
+    if [ -n "${EPOCHREALTIME:-}" ]; then
+        local sec="${EPOCHREALTIME%%.*}" frac="${EPOCHREALTIME#*.}"
+        echo $(( sec * 1000 + 10#${frac:0:3} ))
+    else
+        echo $(( $(date +%s) * 1000 ))
+    fi
+}
+
 # Many Kubernetes-ecosystem components (metrics-server, controller-manager,
 # kube-proxy, etc.) log via klog, whose line format is a level letter
 # (I=Info, W=Warning, E=Error, F=Fatal) immediately after the timestamp,
@@ -663,8 +694,11 @@ kubectl cluster-info >> "$REPORT" 2>&1
 
 section "1. KUBERNETES CONTROL PLANE"
 
+API_T0=$(now_ms)
 READYZ_OUT=$(kubectl get --raw='/readyz?verbose' 2>&1)
 READYZ_RC=$?
+API_T1=$(now_ms)
+READYZ_LATENCY_MS=$((API_T1 - API_T0))
 echo "$READYZ_OUT" >> "$REPORT"
 if [ $READYZ_RC -eq 0 ] && echo "$READYZ_OUT" | grep -qi "^readyz check passed\|ok$" ; then
     READYZ_STATE="HEALTHY"
@@ -674,8 +708,11 @@ else
     fix "Check: kubectl get --raw='/readyz?verbose'"
 fi
 
+API_T0=$(now_ms)
 LIVEZ_OUT=$(kubectl get --raw='/livez?verbose' 2>&1)
 LIVEZ_RC=$?
+API_T1=$(now_ms)
+LIVEZ_LATENCY_MS=$((API_T1 - API_T0))
 echo "$LIVEZ_OUT" >> "$REPORT"
 if [ $LIVEZ_RC -eq 0 ] && echo "$LIVEZ_OUT" | grep -qi "^livez check passed\|ok$"; then
     LIVEZ_STATE="HEALTHY"
@@ -683,6 +720,27 @@ else
     LIVEZ_STATE="PROBLEM"
     error "Kubernetes /livez reports a problem."
     fix "Check: kubectl get --raw='/livez?verbose'"
+fi
+
+# --- API server latency self-check: this scanner's own kubectl calls are
+# the measurement. A slow response here (control plane or etcd overloaded)
+# cascades into every controller and every app that talks to the API, and
+# is one of the most common infra-wide causes of "everything feels slow"
+# with no single crashing pod to point at. This is a single-sample check,
+# not a trend -- a one-off blip can false-positive; corroborate with the
+# etcd health check below and repeat runs before concluding this is a
+# root cause.
+API_LATENCY_MS=$READYZ_LATENCY_MS
+[ "$LIVEZ_LATENCY_MS" -gt "$API_LATENCY_MS" ] && API_LATENCY_MS=$LIVEZ_LATENCY_MS
+
+if [ "$API_LATENCY_MS" -ge "$API_LATENCY_CRIT_MS" ]; then
+    critical "API server response time is elevated: ${API_LATENCY_MS}ms (critical threshold: ${API_LATENCY_CRIT_MS}ms) -- may indicate an overloaded control plane or slow etcd, which can cascade into slowness across the whole cluster."
+    record_fact 12 API_LATENCY "-" "$CURRENT_CONTEXT" "infra" "API server /readyz-or-livez response took ${API_LATENCY_MS}ms (>= ${API_LATENCY_CRIT_MS}ms critical threshold) -- single-sample reading; corroborate with etcd health and repeat runs before treating as confirmed root cause"
+elif [ "$API_LATENCY_MS" -ge "$API_LATENCY_WARN_MS" ]; then
+    warn "API server response time is somewhat elevated: ${API_LATENCY_MS}ms (warning threshold: ${API_LATENCY_WARN_MS}ms)."
+    record_fact 12 API_LATENCY "-" "$CURRENT_CONTEXT" "infra" "API server /readyz-or-livez response took ${API_LATENCY_MS}ms (>= ${API_LATENCY_WARN_MS}ms warning threshold)"
+else
+    info "API server response time: ${API_LATENCY_MS}ms (healthy, below ${API_LATENCY_WARN_MS}ms)."
 fi
 
 # CoreDNS as part of control-plane-adjacent health (checked in detail later too)
@@ -699,10 +757,58 @@ if [ "$READYZ_STATE" = "HEALTHY" ] && [ "$LIVEZ_STATE" = "HEALTHY" ]; then
     CONTROL_PLANE_STATUS="HEALTHY"
 else
     CONTROL_PLANE_STATUS="INVESTIGATION REQUIRED"
-    record_fact 10 CONTROL_PLANE cluster "$CURRENT_CONTEXT" "infra" "readyz=$READYZ_STATE livez=$LIVEZ_STATE"
+    record_fact 10 CONTROL_PLANE "-" "$CURRENT_CONTEXT" "infra" "readyz=$READYZ_STATE livez=$LIVEZ_STATE"
 fi
 
 info "Control plane: readyz=$READYZ_STATE livez=$LIVEZ_STATE coredns=$COREDNS_STATE"
+
+###############################################################################
+# 1B. ETCD HEALTH (best-effort -- only visible on kubeadm-style clusters
+# where etcd runs as a static pod in kube-system; managed clusters like
+# EKS/GKE/AKS run etcd outside the cluster entirely and this section will
+# correctly report "not detected" rather than a false negative).
+#
+# Slow etcd (disk fsync latency, leader churn) is a classic, high-signal,
+# purely read-only-detectable cause of cluster-wide slowness: etcd itself
+# logs explicit "slow fdatasync" / "took too long" warnings when this
+# happens, well before it becomes an outright outage.
+###############################################################################
+
+section "1C. ETCD HEALTH (best-effort)"
+
+ETCD_PODS=$(kubectl get pods -n kube-system -l component=etcd -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
+if [ -z "$ETCD_PODS" ]; then
+    ETCD_PODS=$(kubectl get pods -n kube-system -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | grep -E '^etcd(-|$)')
+fi
+
+ETCD_SLOW_PATTERN='slow fdatasync|took too long|apply request took|waiting for readindex|failed to send out heartbeat|elected leader|lost leader|slow request'
+ETCD_MATCH_COUNT=0
+ETCD_POD_COUNT=0
+
+if [ -z "$ETCD_PODS" ]; then
+    info "No etcd pod found in kube-system -- either this is a managed cluster (EKS/GKE/AKS) where etcd runs outside Kubernetes and is not visible here, or a non-standard etcd deployment. Not a failure of this check."
+else
+    for ETCD_POD in $ETCD_PODS; do
+        ETCD_POD_COUNT=$((ETCD_POD_COUNT+1))
+        ETCD_LOG_FILE="$REPORT_DIR/logs/etcd_${ETCD_POD}.log"
+        kubectl logs "$ETCD_POD" -n kube-system --since="${SCAN_MINUTES}m" --timestamps > "$ETCD_LOG_FILE" 2>&1
+        ETCD_MATCHES=$(grep -Ei "$ETCD_SLOW_PATTERN" "$ETCD_LOG_FILE" 2>/dev/null)
+        if [ -n "$ETCD_MATCHES" ]; then
+            THIS_COUNT=$(echo "$ETCD_MATCHES" | grep -c .)
+            ETCD_MATCH_COUNT=$((ETCD_MATCH_COUNT + THIS_COUNT))
+            error "etcd ($ETCD_POD): $THIS_COUNT slow-operation warning(s) in the last ${SCAN_MINUTES}m -- classic early signal of disk/latency-driven cluster-wide slowness."
+            { echo ""; echo "ETCD SLOW: $ETCD_POD"; echo "$ETCD_MATCHES" | redact; } >> "$ERROR_REPORT"
+            FIRST_ETCD_LINE=$(echo "$ETCD_MATCHES" | head -1 | cut -c1-200 | redact)
+            record_fact 15 ETCD_SLOW "-" "$ETCD_POD" "infra" "$THIS_COUNT slow-operation warning(s) ($FIRST_ETCD_LINE) -- check disk I/O latency on the node hosting etcd" "$(extract_log_ts "$FIRST_ETCD_LINE")"
+            fix "kubectl logs $ETCD_POD -n kube-system --since=${SCAN_MINUTES}m --timestamps | grep -Ei 'slow fdatasync|took too long'"
+            fix "On the node hosting $ETCD_POD: check disk I/O latency (iostat/fio), since etcd fsyncs every write"
+        fi
+        search_context "$ETCD_LOG_FILE" "etcd: $ETCD_POD"
+    done
+    if [ "$ETCD_MATCH_COUNT" -eq 0 ]; then
+        info "etcd: $ETCD_POD_COUNT pod(s) checked, no slow-operation warnings in the last ${SCAN_MINUTES}m."
+    fi
+fi
 
 ###############################################################################
 # 2. NODES
@@ -722,6 +828,34 @@ fi
 
 NODE_LIST=$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
 
+# --- Kubernetes quantity parsing for the oversubscription check below.
+# Deliberately approximate (decimal M/G treated ~= binary Mi/Gi) -- this is
+# a triage signal ("is this node roughly oversubscribed?"), not a billing
+# calculation, and exact byte-precision doesn't change the conclusion.
+cpu_to_millicores() {
+    local v="$1"
+    [ -z "$v" ] && { echo 0; return; }
+    if [[ "$v" == *m ]]; then
+        echo "${v%m}"
+    else
+        echo $(( ${v%.*} * 1000 ))
+    fi
+}
+mem_to_mi() {
+    local v="$1"
+    [ -z "$v" ] && { echo 0; return; }
+    case "$v" in
+        *Ki) echo $(( ${v%Ki} / 1024 )) ;;
+        *Mi) echo "${v%Mi}" ;;
+        *Gi) echo $(( ${v%Gi} * 1024 )) ;;
+        *Ti) echo $(( ${v%Ti} * 1024 * 1024 )) ;;
+        *k)  echo $(( ${v%k} * 1000 / 1024 / 1024 )) ;;
+        *M)  echo "${v%M}" ;;
+        *G)  echo $(( ${v%G} * 1024 )) ;;
+        *)   echo $(( v / 1024 / 1024 )) ;;   # bare bytes
+    esac
+}
+
 for NODE in $NODE_LIST; do
     NODE_DESC_FILE=$(mktemp)
     kubectl describe node "$NODE" > "$NODE_DESC_FILE" 2>&1
@@ -738,6 +872,51 @@ for NODE in $NODE_LIST; do
     echo "$COND" | grep -q "DiskPressure=True"    && { error "Node $NODE has DiskPressure. ($IPS)"; record_fact 20 NODE_PRESSURE "-" "$NODE" "infra" "DiskPressure ($IPS)"; }
     echo "$COND" | grep -q "PIDPressure=True"     && { error "Node $NODE has PIDPressure. ($IPS)"; record_fact 20 NODE_PRESSURE "-" "$NODE" "infra" "PIDPressure ($IPS)"; }
     echo "$COND" | grep -q "NetworkUnavailable=True" && { error "Node $NODE reports NetworkUnavailable. ($IPS)"; record_fact 20 NODE_NETWORK "-" "$NODE" "network" "NetworkUnavailable ($IPS)"; }
+
+    # --- Node oversubscription: requested vs. allocatable. A node running
+    # near its allocatable CPU/memory from REQUESTS alone (regardless of
+    # actual live usage) is a classic, purely-declarative cause of
+    # scheduling delays, CPU contention, and "everything on this node
+    # feels slow" -- and it's invisible to `kubectl top`, which only shows
+    # current usage, not how tightly packed the node's declared requests
+    # are.
+    ALLOC_CPU_RAW=$(kubectl get node "$NODE" -o jsonpath='{.status.allocatable.cpu}' 2>/dev/null)
+    ALLOC_MEM_RAW=$(kubectl get node "$NODE" -o jsonpath='{.status.allocatable.memory}' 2>/dev/null)
+    ALLOC_CPU_M=$(cpu_to_millicores "$ALLOC_CPU_RAW")
+    ALLOC_MEM_MI=$(mem_to_mi "$ALLOC_MEM_RAW")
+
+    REQ_CPU_TOTAL_M=0
+    REQ_MEM_TOTAL_MI=0
+    NODE_POD_REQUESTS=$(kubectl get pods -A --field-selector spec.nodeName="$NODE" \
+        -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.resources.requests.cpu}{"\t"}{.resources.requests.memory}{"\n"}{end}{end}' 2>/dev/null)
+    while IFS=$'\t' read -r c_req m_req; do
+        [ -z "$c_req" ] && [ -z "$m_req" ] && continue
+        REQ_CPU_TOTAL_M=$((REQ_CPU_TOTAL_M + $(cpu_to_millicores "$c_req")))
+        REQ_MEM_TOTAL_MI=$((REQ_MEM_TOTAL_MI + $(mem_to_mi "$m_req")))
+    done <<< "$NODE_POD_REQUESTS"
+
+    if [ "$ALLOC_CPU_M" -gt 0 ] 2>/dev/null; then
+        CPU_PCT=$(( REQ_CPU_TOTAL_M * 100 / ALLOC_CPU_M ))
+    else
+        CPU_PCT=0
+    fi
+    if [ "$ALLOC_MEM_MI" -gt 0 ] 2>/dev/null; then
+        MEM_PCT=$(( REQ_MEM_TOTAL_MI * 100 / ALLOC_MEM_MI ))
+    else
+        MEM_PCT=0
+    fi
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$NODE" "$REQ_CPU_TOTAL_M" "$ALLOC_CPU_M" "$CPU_PCT" "$REQ_MEM_TOTAL_MI" "$ALLOC_MEM_MI" "$MEM_PCT" >> "$REPORT_DIR/data/node-oversubscription.tsv"
+
+    if [ "$CPU_PCT" -ge "$NODE_CPU_CRIT_PCT" ] 2>/dev/null || [ "$MEM_PCT" -ge "$NODE_MEM_CRIT_PCT" ] 2>/dev/null; then
+        error "Node $NODE is oversubscribed by REQUESTS: CPU ${CPU_PCT}% (${REQ_CPU_TOTAL_M}m/${ALLOC_CPU_M}m), Memory ${MEM_PCT}% (${REQ_MEM_TOTAL_MI}Mi/${ALLOC_MEM_MI}Mi) of allocatable -- little scheduling headroom; likely contributor to CPU contention/slowness for pods here, even if kubectl top shows moderate live usage."
+        record_fact 22 NODE_OVERSUBSCRIBED "-" "$NODE" "infra-or-developer" "Requested CPU ${CPU_PCT}% / Memory ${MEM_PCT}% of allocatable -- from declared resource requests, not live usage; reduce requests or add node capacity"
+        fix "kubectl describe node $NODE   # see 'Allocated resources' section"
+        fix "kubectl get pods -A --field-selector spec.nodeName=$NODE -o wide"
+    elif [ "$CPU_PCT" -ge "$NODE_CPU_WARN_PCT" ] 2>/dev/null || [ "$MEM_PCT" -ge "$NODE_MEM_WARN_PCT" ] 2>/dev/null; then
+        warn "Node $NODE requests are getting tight: CPU ${CPU_PCT}%, Memory ${MEM_PCT}% of allocatable."
+        record_fact 22 NODE_OVERSUBSCRIBED "-" "$NODE" "infra-or-developer" "Requested CPU ${CPU_PCT}% / Memory ${MEM_PCT}% of allocatable -- approaching capacity"
+    fi
 done
 
 fix "Node OS-level history (kubelet/kernel/containerd journal for the last ${SCAN_MINUTES} min)"
@@ -786,6 +965,24 @@ info "Events: $EVENTS_IN_WINDOW of $TOTAL_RETAINED_EVENTS currently-retained eve
 ###############################################################################
 # 4. NAMESPACE / WORKLOAD SCAN
 ###############################################################################
+
+# --- Pod CPU/memory usage snapshot, fetched ONCE cluster-wide here (not
+# per-pod in the loop below) to avoid one extra kubectl call per pod on a
+# large cluster. Cross-referenced against each pod's own declared
+# requests/limits during the per-pod loop below -- a raw "340Mi" number is
+# meaningless without knowing whether that's near, at, or nowhere close to
+# what the pod is allowed to use. Gracefully skipped if Metrics Server
+# isn't installed (same condition the existing section 7 top-nodes/pods
+# checks already handle).
+POD_METRICS_FILE="$REPORT_DIR/data/pod-metrics-raw.tsv"
+POD_METRICS_AVAILABLE=0
+if kubectl top pods -A --no-headers > "$POD_METRICS_FILE" 2>/dev/null && [ -s "$POD_METRICS_FILE" ]; then
+    POD_METRICS_AVAILABLE=1
+else
+    : > "$POD_METRICS_FILE"
+    warn "kubectl top pods unavailable (Metrics Server may not be installed) -- per-pod CPU/memory usage will not be included in this report."
+    fix "Check: kubectl get pods -n kube-system | grep metrics"
+fi
 
 # When scope is SELECTED (specific pods chosen), only namespaces that
 # contain at least one selected pod are visited, and within each such
@@ -840,6 +1037,35 @@ for NS in $NAMESPACE_LIST; do
             error "StatefulSet $NS/$SS READY=$SS_READY DESIRED=$SS_DESIRED."
             fix "kubectl describe statefulset $SS -n $NS"
             record_fact 55 STATEFULSET_NOT_READY "$NS" "$SS" "infra-or-developer" "StatefulSet $SS: $SS_READY/$SS_DESIRED replicas ready"
+        fi
+    done
+
+    # --- HPA: a Deployment/StatefulSet can look perfectly healthy (all
+    # desired replicas Ready) while still being the reason an app "works
+    # but is slow" -- too few replicas for current load, autoscaler maxed
+    # out, or the HPA unable to read metrics at all. None of that shows up
+    # in the ready-vs-desired check above, since "desired" here is set by
+    # the HPA itself, not a fixed spec value. ---
+    HPA_LIST=$(kubectl get hpa -n "$NS" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
+    for HPA in $HPA_LIST; do
+        HPA_CUR=$(kubectl get hpa "$HPA" -n "$NS" -o jsonpath='{.status.currentReplicas}' 2>/dev/null)
+        HPA_MIN=$(kubectl get hpa "$HPA" -n "$NS" -o jsonpath='{.spec.minReplicas}' 2>/dev/null)
+        HPA_MAX=$(kubectl get hpa "$HPA" -n "$NS" -o jsonpath='{.spec.maxReplicas}' 2>/dev/null)
+        HPA_TARGET=$(kubectl get hpa "$HPA" -n "$NS" -o jsonpath='{.spec.scaleTargetRef.name}' 2>/dev/null)
+        HPA_SCALING_ACTIVE=$(kubectl get hpa "$HPA" -n "$NS" -o jsonpath='{range .status.conditions[?(@.type=="ScalingActive")]}{.status}{end}' 2>/dev/null)
+
+        echo "HPA $NS/$HPA  target=$HPA_TARGET current=$HPA_CUR min=$HPA_MIN max=$HPA_MAX ScalingActive=$HPA_SCALING_ACTIVE" >> "$REPORT"
+
+        if [ "$HPA_SCALING_ACTIVE" = "False" ]; then
+            error "HPA $NS/$HPA (target: $HPA_TARGET) has ScalingActive=False -- it cannot read the metrics it needs to scale at all. If load is currently high, this workload will NOT scale up, which will feel like slowness/timeouts under load."
+            fix "kubectl describe hpa $HPA -n $NS   # check the exact reason under Conditions"
+            fix "kubectl get pods -n kube-system -l k8s-app=metrics-server   # confirm metrics-server itself is healthy"
+            record_fact 43 HPA_INACTIVE "$NS" "$HPA" "infra-or-developer" "HPA for $HPA_TARGET has ScalingActive=False -- cannot obtain metrics to scale on; will not respond to load regardless of traffic"
+        elif [ -n "$HPA_CUR" ] && [ -n "$HPA_MAX" ] && [ "$HPA_CUR" -ge "$HPA_MAX" ] 2>/dev/null; then
+            warn "HPA $NS/$HPA (target: $HPA_TARGET) is at its maximum: $HPA_CUR/$HPA_MAX replicas. If it's still under load, this is a capacity ceiling, not a bug -- raise maxReplicas or node capacity."
+            fix "kubectl describe hpa $HPA -n $NS"
+            fix "kubectl top pods -n $NS -l app=$HPA_TARGET 2>/dev/null"
+            record_fact 43 HPA_MAXED "$NS" "$HPA" "developer-or-infra" "HPA for $HPA_TARGET is maxed at $HPA_CUR/$HPA_MAX replicas -- likely under-provisioned for current load if traffic is still elevated"
         fi
     done
 
@@ -1016,6 +1242,54 @@ for NS in $NAMESPACE_LIST; do
             else
                 warn "Pod $NS/$POD is Running but not Ready (no readinessProbe is defined -- likely still starting up or cycling through restarts, not a probe failure)."
                 record_fact 40 READINESS_FAIL "$NS" "$POD" "developer" "Running but Ready=False with NO readinessProbe defined -- check container startup/restart state (e.g. CrashLoopBackOff, OOM) rather than probe config; pod is excluded from Service endpoints"
+            fi
+        fi
+
+        # --- CPU/memory usage vs. requests/limits. A raw "340Mi" or "120m"
+        # number means nothing on its own -- this cross-references live
+        # usage (from the cluster-wide metrics snapshot fetched before this
+        # loop) against what the pod itself declares it's allowed to use.
+        # Usage near/at the MEMORY limit is a leading indicator of an
+        # impending OOMKill; usage near/at the CPU limit is a leading
+        # indicator of CPU throttling (which this scanner otherwise cannot
+        # detect directly -- see Coverage Limitations). A pod with NO
+        # limit set is reported as such rather than skipped, since that is
+        # itself worth knowing (unbounded CPU/memory is a stability risk
+        # for its neighbors, not just itself).
+        if [ "$POD_METRICS_AVAILABLE" = "1" ]; then
+            POD_USAGE_LINE=$(awk -v ns="$NS" -v pod="$POD" '$1==ns && $2==pod {print $3"\t"$4}' "$POD_METRICS_FILE")
+            if [ -n "$POD_USAGE_LINE" ]; then
+                USAGE_CPU_RAW="${POD_USAGE_LINE%%$'\t'*}"
+                USAGE_MEM_RAW="${POD_USAGE_LINE##*$'\t'}"
+                USAGE_CPU_M=$(cpu_to_millicores "$USAGE_CPU_RAW")
+                USAGE_MEM_MI=$(mem_to_mi "$USAGE_MEM_RAW")
+
+                REQ_CPU_M=$(kubectl get pod "$POD" -n "$NS" -o jsonpath='{range .spec.containers[*]}{.resources.requests.cpu}{" "}{end}' 2>/dev/null | tr ' ' '\n' | while read -r v; do cpu_to_millicores "$v"; done | awk '{s+=$1} END{print s+0}')
+                LIM_CPU_M=$(kubectl get pod "$POD" -n "$NS" -o jsonpath='{range .spec.containers[*]}{.resources.limits.cpu}{" "}{end}' 2>/dev/null | tr ' ' '\n' | while read -r v; do cpu_to_millicores "$v"; done | awk '{s+=$1} END{print s+0}')
+                REQ_MEM_MI=$(kubectl get pod "$POD" -n "$NS" -o jsonpath='{range .spec.containers[*]}{.resources.requests.memory}{" "}{end}' 2>/dev/null | tr ' ' '\n' | while read -r v; do mem_to_mi "$v"; done | awk '{s+=$1} END{print s+0}')
+                LIM_MEM_MI=$(kubectl get pod "$POD" -n "$NS" -o jsonpath='{range .spec.containers[*]}{.resources.limits.memory}{" "}{end}' 2>/dev/null | tr ' ' '\n' | while read -r v; do mem_to_mi "$v"; done | awk '{s+=$1} END{print s+0}')
+
+                CPU_OF_LIMIT_PCT="n/a"; MEM_OF_LIMIT_PCT="n/a"
+                [ "$LIM_CPU_M" -gt 0 ] 2>/dev/null && CPU_OF_LIMIT_PCT=$(( USAGE_CPU_M * 100 / LIM_CPU_M ))
+                [ "$LIM_MEM_MI" -gt 0 ] 2>/dev/null && MEM_OF_LIMIT_PCT=$(( USAGE_MEM_MI * 100 / LIM_MEM_MI ))
+
+                printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                    "$NS" "$POD" "$USAGE_CPU_M" "$REQ_CPU_M" "$LIM_CPU_M" "$CPU_OF_LIMIT_PCT" \
+                    "$USAGE_MEM_MI" "$REQ_MEM_MI" "$LIM_MEM_MI" "$MEM_OF_LIMIT_PCT" >> "$REPORT_DIR/data/pod-resource-usage.tsv"
+
+                if [ "$CPU_OF_LIMIT_PCT" != "n/a" ] && [ "$CPU_OF_LIMIT_PCT" -ge "$POD_CPU_CRIT_PCT" ] 2>/dev/null; then
+                    error "Pod $NS/$POD CPU usage is ${CPU_OF_LIMIT_PCT}% of its limit (${USAGE_CPU_M}m/${LIM_CPU_M}m) -- at high risk of CPU throttling (which this scanner cannot directly observe), a common invisible cause of app-perceived slowness."
+                    record_fact 47 POD_CPU_HIGH "$NS" "$POD" "developer-or-infra" "CPU usage ${CPU_OF_LIMIT_PCT}% of limit (${USAGE_CPU_M}m/${LIM_CPU_M}m) -- likely being throttled or about to be; raise the CPU limit or reduce load"
+                elif [ "$CPU_OF_LIMIT_PCT" != "n/a" ] && [ "$CPU_OF_LIMIT_PCT" -ge "$POD_CPU_WARN_PCT" ] 2>/dev/null; then
+                    warn "Pod $NS/$POD CPU usage is ${CPU_OF_LIMIT_PCT}% of its limit (${USAGE_CPU_M}m/${LIM_CPU_M}m)."
+                fi
+
+                if [ "$MEM_OF_LIMIT_PCT" != "n/a" ] && [ "$MEM_OF_LIMIT_PCT" -ge "$POD_MEM_CRIT_PCT" ] 2>/dev/null; then
+                    error "Pod $NS/$POD memory usage is ${MEM_OF_LIMIT_PCT}% of its limit (${USAGE_MEM_MI}Mi/${LIM_MEM_MI}Mi) -- at high risk of imminent OOMKill."
+                    record_fact 46 POD_MEM_HIGH "$NS" "$POD" "developer-or-infra" "Memory usage ${MEM_OF_LIMIT_PCT}% of limit (${USAGE_MEM_MI}Mi/${LIM_MEM_MI}Mi) -- likely to be OOMKilled soon; raise the memory limit or investigate a possible leak"
+                elif [ "$MEM_OF_LIMIT_PCT" != "n/a" ] && [ "$MEM_OF_LIMIT_PCT" -ge "$POD_MEM_WARN_PCT" ] 2>/dev/null; then
+                    warn "Pod $NS/$POD memory usage is ${MEM_OF_LIMIT_PCT}% of its limit (${USAGE_MEM_MI}Mi/${LIM_MEM_MI}Mi)."
+                fi
             fi
         fi
 
@@ -1292,10 +1566,15 @@ fi
 
 section "7. RESOURCE USAGE AND STORAGE"
 
-if kubectl top pods -A >/dev/null 2>&1; then
-    kubectl top pods -A --sort-by=cpu > "$REPORT_DIR/data/pods-by-cpu.txt"
-    kubectl top pods -A --sort-by=memory > "$REPORT_DIR/data/pods-by-memory.txt"
-    cat "$REPORT_DIR/data/pods-by-cpu.txt" "$REPORT_DIR/data/pods-by-memory.txt" >> "$REPORT"
+if [ "$POD_METRICS_AVAILABLE" = "1" ]; then
+    # Not sorted here with `sort -h`: GNU sort's human-numeric sort does
+    # not understand Kubernetes' millicore "m" suffix (e.g. "450m") and
+    # would silently mis-order the CPU column. The properly unit-converted,
+    # correctly sortable comparison lives in the "Pod Resource Usage"
+    # section of the HTML report instead, built from the same snapshot
+    # using this script's own cpu_to_millicores/mem_to_mi conversion.
+    cat "$POD_METRICS_FILE" >> "$REPORT"
+    info "Per-pod CPU/memory usage: see the 'Pod Resource Usage' section of the HTML report for usage cross-referenced against each pod's own requests/limits."
 else
     warn "Metrics Server data unavailable."
 fi
@@ -1360,6 +1639,13 @@ suggest_cmds() {
         HAPROXY_5XX) echo "kubectl logs $res -n $ns --since=${SCAN_MINUTES}m|kubectl get endpoints -n $ns   # find the backend returning 5xx" ;;
         PROBE_FAIL) echo "kubectl exec ${res%%/*} -n $ns -c ${res##*/} -- curl -v -m ${PROBE_TIMEOUT} http://127.0.0.1:<port>${PROBE_PATH}|kubectl describe pod ${res%%/*} -n $ns|kubectl logs ${res%%/*} -n $ns -c ${res##*/} --since=${SCAN_MINUTES}m" ;;
         F5_BLOCKED) echo "Review full match context in the report's data/f5-external.log|On BIG-IP: search the ASM event log using the support_id in the matched line|On BIG-IP: tmsh show ltm pool <pool> members|On BIG-IP: tmsh show ltm virtual <vs> profiles|On BIG-IP: review iRules on the affected virtual server for drop/reject actions" ;;
+        API_LATENCY) echo "kubectl get --raw='/readyz?verbose'|kubectl get --raw='/livez?verbose'|kubectl get componentstatuses 2>/dev/null|kubectl logs -n kube-system -l component=etcd --since=${SCAN_MINUTES}m --timestamps" ;;
+        ETCD_SLOW) echo "kubectl logs $res -n kube-system --since=${SCAN_MINUTES}m --timestamps | grep -Ei 'slow fdatasync|took too long'|On the node hosting $res: check disk I/O latency (iostat/fio) -- etcd fsyncs on every write" ;;
+        NODE_OVERSUBSCRIBED) echo "kubectl describe node $res   # see 'Allocated resources' section|kubectl get pods -A --field-selector spec.nodeName=$res -o wide|kubectl top pod -A --field-selector spec.nodeName=$res 2>/dev/null" ;;
+        HPA_INACTIVE) echo "kubectl describe hpa $res -n $ns   # check Conditions for the exact reason|kubectl get pods -n kube-system -l k8s-app=metrics-server|kubectl top pods -n $ns" ;;
+        HPA_MAXED) echo "kubectl describe hpa $res -n $ns|kubectl top pods -n $ns|kubectl describe node   # check if there is spare node capacity for more replicas" ;;
+        POD_CPU_HIGH) echo "kubectl top pod $res -n $ns --containers|kubectl get pod $res -n $ns -o jsonpath='{.spec.containers[*].resources}'|kubectl describe pod $res -n $ns   # review resources.limits.cpu" ;;
+        POD_MEM_HIGH) echo "kubectl top pod $res -n $ns --containers|kubectl get pod $res -n $ns -o jsonpath='{.spec.containers[*].resources}'|kubectl describe pod $res -n $ns   # review resources.limits.memory" ;;
         *) echo "kubectl describe pod $res -n $ns" ;;
     esac
 }
@@ -1644,6 +1930,49 @@ case "$REDIS_STATUS_RANK" in
     *) REDIS_STATUS_CLASS="warn" ;;
 esac
 
+# --- Precompute Performance / Slowness Indicators summary stats ---
+if [ "$API_LATENCY_MS" -ge "$API_LATENCY_CRIT_MS" ] 2>/dev/null; then
+    API_LATENCY_CLASS="crit"
+elif [ "$API_LATENCY_MS" -ge "$API_LATENCY_WARN_MS" ] 2>/dev/null; then
+    API_LATENCY_CLASS="warn"
+else
+    API_LATENCY_CLASS="ok"
+fi
+
+if [ -z "$ETCD_PODS" ]; then
+    ETCD_STATUS_TEXT="NOT VISIBLE (managed cluster or non-standard etcd)"; ETCD_STATUS_CLASS="warn"
+elif [ "$ETCD_MATCH_COUNT" -gt 0 ] 2>/dev/null; then
+    ETCD_STATUS_TEXT="${ETCD_MATCH_COUNT} slow-op warning(s) across ${ETCD_POD_COUNT} pod(s)"; ETCD_STATUS_CLASS="err"
+else
+    ETCD_STATUS_TEXT="${ETCD_POD_COUNT} pod(s) checked, clean"; ETCD_STATUS_CLASS="ok"
+fi
+
+NODE_OVERSUB_COUNT=0
+if [ -s "$REPORT_DIR/data/node-oversubscription.tsv" ]; then
+    NODE_OVERSUB_COUNT=$(awk -F'\t' -v c="$NODE_CPU_WARN_PCT" -v m="$NODE_MEM_WARN_PCT" '$4>=c || $7>=m' "$REPORT_DIR/data/node-oversubscription.tsv" | wc -l | tr -d ' ')
+fi
+if [ "$NODE_OVERSUB_COUNT" -gt 0 ] 2>/dev/null; then
+    NODE_OVERSUB_CLASS="err"; NODE_OVERSUB_TEXT="${NODE_OVERSUB_COUNT} node(s) tight on requests"
+else
+    NODE_OVERSUB_CLASS="ok"; NODE_OVERSUB_TEXT="within limits"
+fi
+
+HPA_ISSUE_COUNT=$(awk -F'\t' '$2=="HPA_INACTIVE" || $2=="HPA_MAXED"' "$FACTS_FILE" 2>/dev/null | wc -l | tr -d ' ')
+if [ "$HPA_ISSUE_COUNT" -gt 0 ] 2>/dev/null; then
+    HPA_CLASS="err"; HPA_TEXT="${HPA_ISSUE_COUNT} HPA(s) inactive or maxed"
+else
+    HPA_CLASS="ok"; HPA_TEXT="no HPA issues found"
+fi
+
+POD_RES_ISSUE_COUNT=$(awk -F'\t' '$2=="POD_CPU_HIGH" || $2=="POD_MEM_HIGH"' "$FACTS_FILE" 2>/dev/null | wc -l | tr -d ' ')
+if [ "$POD_METRICS_AVAILABLE" != "1" ]; then
+    POD_RES_CLASS="warn"; POD_RES_TEXT="metrics unavailable"
+elif [ "$POD_RES_ISSUE_COUNT" -gt 0 ] 2>/dev/null; then
+    POD_RES_CLASS="err"; POD_RES_TEXT="${POD_RES_ISSUE_COUNT} pod(s) near CPU/memory limit"
+else
+    POD_RES_CLASS="ok"; POD_RES_TEXT="no pods near their limits"
+fi
+
 cat >> "$REPORT" <<EOF
 
 ====================================================================
@@ -1750,6 +2079,19 @@ table{font-size:13px} th{color:#9aa0aa;font-weight:600}
 <div>CoreDNS <span class="badge $([ "$COREDNS_STATE" = HEALTHY ] && echo ok || echo warn)">$COREDNS_STATE</span></div>
 <div>Endpoint probes <span class="badge $PROBE_STATUS_CLASS">$PROBE_STATUS_TEXT</span></div>
 <div>F5 / external LB <span class="badge $F5_STATUS_CLASS">$F5_STATUS_TEXT</span></div>
+<div>API server latency <span class="badge $API_LATENCY_CLASS">${API_LATENCY_MS}ms</span></div>
+</div>
+</div>
+
+<div class="card">
+<h2 style="margin-top:0;border:none">Performance / Slowness Indicators</h2>
+<p style="color:#9aa0aa;font-size:13px">Circumstantial evidence toward common INFRASTRUCTURE-side causes of "the app works but is slow". This cannot diagnose a slow application request path itself (a slow SQL query, a slow third-party call, slow app code) -- that needs distributed tracing or an APM this scanner has no access to. Treat everything here as "rule this in or out", not a confirmed diagnosis, especially the single-sample API latency reading below.</p>
+<div class="grid">
+<div>etcd <span class="badge $ETCD_STATUS_CLASS">$ETCD_STATUS_TEXT</span></div>
+<div>Node requests vs. allocatable <span class="badge $NODE_OVERSUB_CLASS">$NODE_OVERSUB_TEXT</span></div>
+<div>HPA (autoscaling) <span class="badge $HPA_CLASS">$HPA_TEXT</span></div>
+<div>Pod CPU/memory vs. limits <span class="badge $POD_RES_CLASS">$POD_RES_TEXT</span></div>
+<div>CPU throttling <span class="badge warn">NOT DETECTABLE (needs Prometheus)</span></div>
 </div>
 </div>
 HTML_HEAD
@@ -1765,6 +2107,61 @@ fi
 # are scan-machine UTC (kubectl-reported event/log timestamps are shown
 # per-item in the Error Catalog below; this view is for at-a-glance shape
 # of the incident, not authoritative per-event time). ---
+echo "<h2>Node Resource Requests vs. Allocatable</h2>"
+echo '<p style="color:#9aa0aa;font-size:13px">Sum of declared container resource REQUESTS on each node, compared to that node'\''s allocatable capacity -- not live usage (see kubectl top for that). A node near 100% here has little scheduling headroom and is a plausible contributor to contention/slowness for everything on it, independent of what kubectl top shows at any given instant.</p>'
+if [ -s "$REPORT_DIR/data/node-oversubscription.tsv" ]; then
+    echo '<div class="card" style="overflow-x:auto"><table style="width:100%;border-collapse:collapse">'
+    echo '<tr style="text-align:left;border-bottom:2px solid #333"><th style="padding:6px">Node</th><th style="padding:6px">CPU requested</th><th style="padding:6px">CPU %</th><th style="padding:6px">Memory requested</th><th style="padding:6px">Memory %</th></tr>'
+    while IFS=$'\t' read -r node reqcpu alloccpu cpupct reqmem allocmem mempct; do
+        [ -z "$node" ] && continue
+        NCLASS="ok"
+        { [ "$cpupct" -ge "$NODE_CPU_WARN_PCT" ] 2>/dev/null || [ "$mempct" -ge "$NODE_MEM_WARN_PCT" ] 2>/dev/null; } && NCLASS="warn"
+        { [ "$cpupct" -ge "$NODE_CPU_CRIT_PCT" ] 2>/dev/null || [ "$mempct" -ge "$NODE_MEM_CRIT_PCT" ] 2>/dev/null; } && NCLASS="err"
+        echo "<tr style=\"border-bottom:1px solid #2a2d36\">"
+        echo "<td style=\"padding:6px\">$(echo "$node" | html_escape)</td>"
+        echo "<td style=\"padding:6px\">${reqcpu}m / ${alloccpu}m</td>"
+        echo "<td style=\"padding:6px\"><span class=\"badge $NCLASS\">${cpupct}%</span></td>"
+        echo "<td style=\"padding:6px\">${reqmem}Mi / ${allocmem}Mi</td>"
+        echo "<td style=\"padding:6px\"><span class=\"badge $NCLASS\">${mempct}%</span></td>"
+        echo "</tr>"
+    done < "$REPORT_DIR/data/node-oversubscription.tsv"
+    echo '</table></div>'
+else
+    echo '<div class="card">No node resource data collected.</div>'
+fi
+
+echo "<h2>Pod Resource Usage (CPU / Memory)</h2>"
+echo '<p style="color:#9aa0aa;font-size:13px">Live usage (from Metrics Server) for every pod covered by this scan, cross-referenced against that pod'\''s own declared requests and limits -- a raw usage number means little without knowing what the pod is actually allowed to use. "no limit" means the container has none set: it cannot be throttled/OOMKilled by its own limit, but it is also an unbounded stability risk for its node neighbors.</p>'
+if [ "$POD_METRICS_AVAILABLE" != "1" ]; then
+    echo '<div class="card">Metrics Server data unavailable for this run -- per-pod usage could not be collected.</div>'
+elif [ -s "$REPORT_DIR/data/pod-resource-usage.tsv" ]; then
+    echo '<div class="card" style="overflow-x:auto"><table style="width:100%;border-collapse:collapse">'
+    echo '<tr style="text-align:left;border-bottom:2px solid #333"><th style="padding:6px">Namespace / Pod</th><th style="padding:6px">CPU usage</th><th style="padding:6px">CPU request / limit</th><th style="padding:6px">CPU % of limit</th><th style="padding:6px">Mem usage</th><th style="padding:6px">Mem request / limit</th><th style="padding:6px">Mem % of limit</th></tr>'
+    while IFS=$'\t' read -r ns pod usagecpu reqcpu limcpu cpupct usagemem reqmem limmem mempct; do
+        [ -z "$pod" ] && continue
+        CCLASS="ok"
+        [ "$cpupct" != "n/a" ] && [ "$cpupct" -ge "$POD_CPU_WARN_PCT" ] 2>/dev/null && CCLASS="warn"
+        [ "$cpupct" != "n/a" ] && [ "$cpupct" -ge "$POD_CPU_CRIT_PCT" ] 2>/dev/null && CCLASS="err"
+        MCLASS="ok"
+        [ "$mempct" != "n/a" ] && [ "$mempct" -ge "$POD_MEM_WARN_PCT" ] 2>/dev/null && MCLASS="warn"
+        [ "$mempct" != "n/a" ] && [ "$mempct" -ge "$POD_MEM_CRIT_PCT" ] 2>/dev/null && MCLASS="err"
+        LIMCPU_DISP="${limcpu}m"; [ "$limcpu" = "0" ] && LIMCPU_DISP="no limit"
+        LIMMEM_DISP="${limmem}Mi"; [ "$limmem" = "0" ] && LIMMEM_DISP="no limit"
+        echo "<tr style=\"border-bottom:1px solid #2a2d36\">"
+        echo "<td style=\"padding:6px\">$(echo "$ns/$pod" | html_escape)</td>"
+        echo "<td style=\"padding:6px\">${usagecpu}m</td>"
+        echo "<td style=\"padding:6px\">${reqcpu}m / $(echo "$LIMCPU_DISP" | html_escape)</td>"
+        echo "<td style=\"padding:6px\"><span class=\"badge $CCLASS\">$(echo "$cpupct" | html_escape)$([ "$cpupct" != "n/a" ] && echo "%")</span></td>"
+        echo "<td style=\"padding:6px\">${usagemem}Mi</td>"
+        echo "<td style=\"padding:6px\">${reqmem}Mi / $(echo "$LIMMEM_DISP" | html_escape)</td>"
+        echo "<td style=\"padding:6px\"><span class=\"badge $MCLASS\">$(echo "$mempct" | html_escape)$([ "$mempct" != "n/a" ] && echo "%")</span></td>"
+        echo "</tr>"
+    done < "$REPORT_DIR/data/pod-resource-usage.tsv"
+    echo '</table></div>'
+else
+    echo '<div class="card">No pods with matching metrics data were found in this scan'\''s scope.</div>'
+fi
+
 echo "<h2>Service Topology -- Service &rarr; ClusterIP &rarr; Endpoints (Ready / Not-Ready)</h2>"
 echo '<p style="color:#9aa0aa;font-size:13px">Built from EndpointSlices (falls back to legacy Endpoints if no slice exists). Each endpoint shows the backing pod name from targetRef, so you can see exactly which pod is or is not serving traffic for a service.</p>'
 if [ -s "$REPORT_DIR/data/service-topology.tsv" ]; then
@@ -1885,6 +2282,12 @@ F5 / external LB / WAF           : NOT visible to this scanner directly -- only 
 Endpoint probe reachability      : when enabled, probes are loopback-only (inside the pod's own container) -- proves the app answers locally, not that other pods/nodes/NetworkPolicy allow reaching it
 Snapshot timing                  : each check is a separate live kubectl call made a moment apart, not one atomic snapshot -- during a rapidly changing/flapping incident, two sections of the same report (e.g. Service Topology vs a pod's own Ready condition) can reflect slightly different instants and may appear to disagree. Trust the most specific, most recent evidence (a pod's own Ready condition, live logs) over aggregate summaries when investigating something actively flapping.
 Root-cause grouping               : candidates are grouped by the resolved owning workload (Deployment/StatefulSet/Job, via ownerReferences), not just by namespace, so unrelated incidents in the same namespace are kept as separate candidates. Remaining edge cases: a bare pod with no owner reference is its own group; a Service with endpoints is grouped with the workload behind those endpoints; a Service with ZERO endpoints has no pod to resolve from and is intentionally left isolated (that absence is itself the finding). Two genuinely distinct workloads that happen to share an identical name across different resource kinds in the same namespace are a residual, unlikely edge case not disambiguated further.
+"App works but is slow" diagnosis : this scanner can only rule common INFRASTRUCTURE-side causes in or out (control plane/etcd latency, node oversubscription, HPA capacity) -- it cannot diagnose a slow application request path (slow SQL, slow third-party call, slow app code), since Kubernetes exposes no per-request latency data and this scanner has no tracing/APM access. If all four Performance indicators are clean, the slowness is very likely inside the application or a dependency it calls, not the cluster.
+API server latency                : a SINGLE-SAMPLE reading taken once during this run, not a trend -- a one-off network blip can false-positive and a real but intermittent slowdown can be missed entirely if it isn't happening at the exact moment this scan runs. Corroborate with the etcd check and repeat runs before treating as a confirmed root cause.
+etcd health                       : best-effort and visible ONLY on kubeatm-style clusters running etcd as a static pod in kube-system. Managed clusters (EKS, GKE, AKS) run etcd outside Kubernetes entirely -- "not detected" there is expected, not a failed check.
+Node oversubscription             : computed from declared resource REQUESTS, not live usage -- a node can show high % here while kubectl top shows it mostly idle (over-requested but under-used), or vice versa (under-requested but a burst of real usage). Both readings are meaningful; neither alone is the full picture.
+CPU throttling                    : NOT detectable by this scanner. A container hitting its CPU limit and being throttled is invisible to both `kubectl top` and the metrics-server API -- that data (container_cpu_cfs_throttled_*) only exists in cAdvisor/Prometheus, which this scanner does not query. This is the single most common invisible-to-this-tool cause of "slow but not crashing".
+Pod CPU/memory usage              : a SINGLE-SAMPLE reading from Metrics Server at scan time, not a trend -- a pod that briefly spikes to 95% of its limit moments before or after this scan runs will not be caught, and a pod caught mid-spike may look worse than its typical behavior. High usage vs. limit is a leading indicator, not a confirmed diagnosis; corroborate with repeat runs or `kubectl top pod --containers -w` for continuous observation.
 </pre></div>
 
 <div style="text-align:center;color:#5a5f6a;font-size:12px;margin:30px 0 10px">
