@@ -254,7 +254,7 @@ for NS in $NAMESPACE_LIST; do
 
             fi
 
-            RESULT=$(echo "$LOG_OUTPUT" | grep -i -C 20 -- "$SEARCH_VALUE" || true)
+            RESULT=$(echo "$LOG_OUTPUT" | grep --color=always -i -C 20 -- "$SEARCH_VALUE" || true)
 
             if [[ -n "$RESULT" ]]; then
 
