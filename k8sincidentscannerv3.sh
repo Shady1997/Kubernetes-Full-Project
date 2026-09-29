@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 ###############################################################################
-# Kubernetes Incident Diagnostic Scanner v2
+# Kubernetes Incident Diagnostic Scanner v3
 #
 # READ-ONLY / NON-MUTATING KUBERNETES RESOURCE SCANNER.
 # (Not "zero side effects": see the kubectl exec note below.)
@@ -50,7 +50,7 @@
 set +e
 
 echo "============================================================"
-echo " KUBERNETES INCIDENT DIAGNOSTIC SCANNER v2"
+echo " KUBERNETES INCIDENT DIAGNOSTIC SCANNER v3"
 echo " Offline / Read-Only / Non-Mutating"
 echo " Developed by Shady Gomaa"
 echo "============================================================"
@@ -637,7 +637,7 @@ probe_service_endpoints() {
     local ns="$1" svc="$2" rows="$3"
     [ "$ENABLE_ENDPOINT_PROBE" = "1" ] || return
     [ -z "$rows" ] && return
-    echo "$rows" | while IFS=$'\t' read -r addr ready podname; do
+    echo "$rows" | awk -F'\t' '{print $1"|"$2"|"$3}' | while IFS='|' read -r addr ready podname; do
         [ -z "$podname" ] && continue
         local label="ready"; [ "$ready" != "true" ] && label="not-ready"
         local containers found=0
@@ -833,27 +833,39 @@ NODE_LIST=$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n
 # a triage signal ("is this node roughly oversubscribed?"), not a billing
 # calculation, and exact byte-precision doesn't change the conclusion.
 cpu_to_millicores() {
+    # Kubernetes CPU quantity -> integer millicores. "500m" -> 500, "2" -> 2000,
+    # "0.5" -> 500. Anything unparseable (or empty) -> 0 rather than an
+    # arithmetic error, so one odd value can never abort the scan section.
     local v="$1"
     [ -z "$v" ] && { echo 0; return; }
-    if [[ "$v" == *m ]]; then
-        echo "${v%m}"
-    else
-        echo $(( ${v%.*} * 1000 ))
-    fi
+    awk -v q="$v" 'BEGIN {
+        if (q ~ /^[0-9]+m$/)                { sub(/m$/, "", q); printf "%d", q; exit }
+        if (q ~ /^[0-9]+(\.[0-9]+)?$/)      { printf "%d", q * 1000; exit }
+        print 0
+    }'
 }
 mem_to_mi() {
+    # Kubernetes memory quantity -> integer MiB. Handles binary (Ki/Mi/Gi/Ti)
+    # and decimal (k/M/G/T) suffixes, fractions ("1.5Gi"), and bare bytes.
+    # Anything unparseable (or empty) -> 0 rather than an arithmetic error.
     local v="$1"
     [ -z "$v" ] && { echo 0; return; }
-    case "$v" in
-        *Ki) echo $(( ${v%Ki} / 1024 )) ;;
-        *Mi) echo "${v%Mi}" ;;
-        *Gi) echo $(( ${v%Gi} * 1024 )) ;;
-        *Ti) echo $(( ${v%Ti} * 1024 * 1024 )) ;;
-        *k)  echo $(( ${v%k} * 1000 / 1024 / 1024 )) ;;
-        *M)  echo "${v%M}" ;;
-        *G)  echo $(( ${v%G} * 1024 )) ;;
-        *)   echo $(( v / 1024 / 1024 )) ;;   # bare bytes
-    esac
+    awk -v q="$v" 'BEGIN {
+        if (match(q, /^[0-9]+(\.[0-9]+)?/) == 0) { print 0; exit }
+        n = substr(q, 1, RLENGTH) + 0
+        u = substr(q, RLENGTH + 1)
+        if      (u == "Ki") m = n / 1024
+        else if (u == "Mi") m = n
+        else if (u == "Gi") m = n * 1024
+        else if (u == "Ti") m = n * 1024 * 1024
+        else if (u == "k")  m = n * 1000 / 1048576
+        else if (u == "M")  m = n * 1000000 / 1048576
+        else if (u == "G")  m = n * 1000000000 / 1048576
+        else if (u == "T")  m = n * 1000000000000 / 1048576
+        else if (u == "")   m = n / 1048576
+        else { print 0; exit }
+        printf "%d", m
+    }'
 }
 
 for NODE in $NODE_LIST; do
@@ -887,9 +899,14 @@ for NODE in $NODE_LIST; do
 
     REQ_CPU_TOTAL_M=0
     REQ_MEM_TOTAL_MI=0
+    # NOTE: fields are joined with "|" and read with IFS='|', NOT tab. Tab is
+    # an IFS *whitespace* character, so consecutive tabs collapse: a container
+    # with a memory request but no CPU request ("\t8Mi") would have its memory
+    # value shifted into the CPU variable and crash the arithmetic below.
+    # "|" is non-whitespace, so an empty field stays empty.
     NODE_POD_REQUESTS=$(kubectl get pods -A --field-selector spec.nodeName="$NODE" \
-        -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.resources.requests.cpu}{"\t"}{.resources.requests.memory}{"\n"}{end}{end}' 2>/dev/null)
-    while IFS=$'\t' read -r c_req m_req; do
+        -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.resources.requests.cpu}{"|"}{.resources.requests.memory}{"\n"}{end}{end}' 2>/dev/null)
+    while IFS='|' read -r c_req m_req; do
         [ -z "$c_req" ] && [ -z "$m_req" ] && continue
         REQ_CPU_TOTAL_M=$((REQ_CPU_TOTAL_M + $(cpu_to_millicores "$c_req")))
         REQ_MEM_TOTAL_MI=$((REQ_MEM_TOTAL_MI + $(mem_to_mi "$m_req")))
@@ -1208,7 +1225,7 @@ for NS in $NAMESPACE_LIST; do
                 # Secret). "kubectl top nodes"/"resourcequota" only helps
                 # the first case; conflating them under one PENDING
                 # category pointed the wrong commands at the wrong fix.
-                WAITING_REASON=$(kubectl get pod "$POD" -n "$NS" -o jsonpath='{range .status.containerStatuses[*]}{.state.waiting.reason}{" "}{end}' 2>/dev/null)
+                WAITING_REASON=$(kubectl get pod "$POD" -n "$NS" -o jsonpath='{range .status.containerStatuses[*]}{.state.waiting.reason}{" "}{end}' 2>/dev/null | sed 's/[[:space:]]*$//')
                 if [ -n "$NODE_NAME" ] && echo "$WAITING_REASON" | grep -Eqi 'ImagePullBackOff|ErrImagePull|InvalidImageName|CreateContainerConfigError|CreateContainerError'; then
                     error "Pod $NS/$POD is Pending due to a container start error on node=$NODE_NAME (reason: $WAITING_REASON)."
                     fix "kubectl describe pod $POD -n $NS   # check Events for the exact image/config/secret error"
@@ -2167,7 +2184,7 @@ echo '<p style="color:#9aa0aa;font-size:13px">Built from EndpointSlices (falls b
 if [ -s "$REPORT_DIR/data/service-topology.tsv" ]; then
     echo '<div class="card" style="overflow-x:auto"><table style="width:100%;border-collapse:collapse">'
     echo '<tr style="text-align:left;border-bottom:2px solid #333"><th style="padding:6px">Namespace</th><th style="padding:6px">Service</th><th style="padding:6px">ClusterIP</th><th style="padding:6px">Ready endpoints</th><th style="padding:6px">Not-Ready endpoints</th></tr>'
-    while IFS=$'\t' read -r ns svc cip ready notready; do
+    while IFS='|' read -r ns svc cip ready notready; do
         [ -z "$svc" ] && continue
         RCLASS="ok"; [ -z "$ready" ] && RCLASS="crit"
         NCLASS=""; [ -n "$notready" ] && NCLASS="warn"
@@ -2183,7 +2200,7 @@ if [ -s "$REPORT_DIR/data/service-topology.tsv" ]; then
         echo "<td style=\"padding:6px\"><span class=\"badge $RCLASS\">$([ -n "$ready" ] && echo "$ready" | html_escape || echo NONE)</span></td>"
         echo "<td style=\"padding:6px\">$NOTREADY_CELL</td>"
         echo "</tr>"
-    done < "$REPORT_DIR/data/service-topology.tsv"
+    done < <(awk -F'\t' '{print $1"|"$2"|"$3"|"$4"|"$5}' "$REPORT_DIR/data/service-topology.tsv")
     echo '</table></div>'
 else
     echo '<div class="card">No services found in scanned namespaces.</div>'
@@ -2280,14 +2297,14 @@ Kubernetes Events                : subject to cluster's event retention window
 Network blocking (NetworkPolicy) : evidence only (endpoints/logs), not packet-level proof
 F5 / external LB / WAF           : NOT visible to this scanner directly -- only via the pluggable F5_LOG_SOURCE / F5_LOG_HOOK hook (opt-in, off unless configured)
 Endpoint probe reachability      : when enabled, probes are loopback-only (inside the pod's own container) -- proves the app answers locally, not that other pods/nodes/NetworkPolicy allow reaching it
-Snapshot timing                  : each check is a separate live kubectl call made a moment apart, not one atomic snapshot -- during a rapidly changing/flapping incident, two sections of the same report (e.g. Service Topology vs a pod's own Ready condition) can reflect slightly different instants and may appear to disagree. Trust the most specific, most recent evidence (a pod's own Ready condition, live logs) over aggregate summaries when investigating something actively flapping.
+Snapshot timing                  : each check is a separate live kubectl call made a moment apart, not one atomic snapshot -- during a rapidly changing/flapping incident, two different checks can in principle reflect slightly different instants. When two sections disagree, trust the most specific, most recent evidence (a pod's own Ready condition, live logs) over aggregate summaries.
 Root-cause grouping               : candidates are grouped by the resolved owning workload (Deployment/StatefulSet/Job, via ownerReferences), not just by namespace, so unrelated incidents in the same namespace are kept as separate candidates. Remaining edge cases: a bare pod with no owner reference is its own group; a Service with endpoints is grouped with the workload behind those endpoints; a Service with ZERO endpoints has no pod to resolve from and is intentionally left isolated (that absence is itself the finding). Two genuinely distinct workloads that happen to share an identical name across different resource kinds in the same namespace are a residual, unlikely edge case not disambiguated further.
 "App works but is slow" diagnosis : this scanner can only rule common INFRASTRUCTURE-side causes in or out (control plane/etcd latency, node oversubscription, HPA capacity) -- it cannot diagnose a slow application request path (slow SQL, slow third-party call, slow app code), since Kubernetes exposes no per-request latency data and this scanner has no tracing/APM access. If all four Performance indicators are clean, the slowness is very likely inside the application or a dependency it calls, not the cluster.
 API server latency                : a SINGLE-SAMPLE reading taken once during this run, not a trend -- a one-off network blip can false-positive and a real but intermittent slowdown can be missed entirely if it isn't happening at the exact moment this scan runs. Corroborate with the etcd check and repeat runs before treating as a confirmed root cause.
-etcd health                       : best-effort and visible ONLY on kubeatm-style clusters running etcd as a static pod in kube-system. Managed clusters (EKS, GKE, AKS) run etcd outside Kubernetes entirely -- "not detected" there is expected, not a failed check.
+etcd health                       : best-effort and visible ONLY on kubeadm-style clusters running etcd as a static pod in kube-system. Managed clusters (EKS, GKE, AKS) run etcd outside Kubernetes entirely -- "not detected" there is expected, not a failed check.
 Node oversubscription             : computed from declared resource REQUESTS, not live usage -- a node can show high % here while kubectl top shows it mostly idle (over-requested but under-used), or vice versa (under-requested but a burst of real usage). Both readings are meaningful; neither alone is the full picture.
-CPU throttling                    : NOT detectable by this scanner. A container hitting its CPU limit and being throttled is invisible to both `kubectl top` and the metrics-server API -- that data (container_cpu_cfs_throttled_*) only exists in cAdvisor/Prometheus, which this scanner does not query. This is the single most common invisible-to-this-tool cause of "slow but not crashing".
-Pod CPU/memory usage              : a SINGLE-SAMPLE reading from Metrics Server at scan time, not a trend -- a pod that briefly spikes to 95% of its limit moments before or after this scan runs will not be caught, and a pod caught mid-spike may look worse than its typical behavior. High usage vs. limit is a leading indicator, not a confirmed diagnosis; corroborate with repeat runs or `kubectl top pod --containers -w` for continuous observation.
+CPU throttling                    : NOT detectable by this scanner. A container hitting its CPU limit and being throttled is invisible to both 'kubectl top' and the metrics-server API -- that data (container_cpu_cfs_throttled_*) only exists in cAdvisor/Prometheus, which this scanner does not query. This is the single most common invisible-to-this-tool cause of "slow but not crashing".
+Pod CPU/memory usage              : a SINGLE-SAMPLE reading from Metrics Server at scan time, not a trend -- a pod that briefly spikes to 95% of its limit moments before or after this scan runs will not be caught, and a pod caught mid-spike may look worse than its typical behavior. High usage vs. limit is a leading indicator, not a confirmed diagnosis; corroborate with repeat runs, or run 'kubectl top pod --containers' several times a few seconds apart, or use a monitoring system for a real trend.
 </pre></div>
 
 <div style="text-align:center;color:#5a5f6a;font-size:12px;margin:30px 0 10px">
