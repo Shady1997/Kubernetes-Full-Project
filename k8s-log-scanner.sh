@@ -1,33 +1,29 @@
 #!/bin/bash
 
-###############################################################################
-# Kubernetes Log Scanner
-###############################################################################
-
-set -euo pipefail
+set -uo pipefail
 
 clear
 
-echo "============================================================"
-echo "         Kubernetes Log Scanner"
-echo "============================================================"
+echo "==============================================================="
+echo "                 Kubernetes Incident Scanner"
+echo "==============================================================="
 
 ###############################################################################
-# SELECT NAMESPACE
+# NAMESPACE SELECTION
 ###############################################################################
 
 while true; do
 
     echo ""
-    echo "Available Namespaces:"
-    echo "------------------------------------------------------------"
+    echo "Available Namespaces"
+    echo "---------------------------------------------------------------"
 
     NAMESPACE_ARRAY=("ALL_NAMESPACES")
 
     while IFS= read -r ns; do
         [ -n "$ns" ] && NAMESPACE_ARRAY+=("$ns")
     done < <(
-        kubectl get namespaces \
+        kubectl get ns \
         -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
         | sort
     )
@@ -38,7 +34,7 @@ while true; do
 
     echo ""
 
-    read -rp "Select Namespace Number: " NS_CHOICE
+    read -r -p "Select Namespace Number: " NS_CHOICE
 
     if [[ "$NS_CHOICE" =~ ^[0-9]+$ ]] &&
        [ "$NS_CHOICE" -ge 1 ] &&
@@ -46,14 +42,14 @@ while true; do
         break
     fi
 
-    echo "Invalid selection. Selection is mandatory."
+    echo "Invalid selection. Please select a valid number."
 
 done
 
 SELECTED_NAMESPACE="${NAMESPACE_ARRAY[$((NS_CHOICE-1))]}"
 
 ###############################################################################
-# SELECT POD
+# POD SELECTION
 ###############################################################################
 
 SELECTED_POD="ALL_PODS"
@@ -64,7 +60,7 @@ if [ "$SELECTED_NAMESPACE" != "ALL_NAMESPACES" ]; then
 
         echo ""
         echo "Pods in Namespace: $SELECTED_NAMESPACE"
-        echo "------------------------------------------------------------"
+        echo "---------------------------------------------------------------"
 
         POD_ARRAY=("ALL_PODS")
 
@@ -82,7 +78,7 @@ if [ "$SELECTED_NAMESPACE" != "ALL_NAMESPACES" ]; then
 
         echo ""
 
-        read -rp "Select Pod Number: " POD_CHOICE
+        read -r -p "Select Pod Number: " POD_CHOICE
 
         if [[ "$POD_CHOICE" =~ ^[0-9]+$ ]] &&
            [ "$POD_CHOICE" -ge 1 ] &&
@@ -90,7 +86,7 @@ if [ "$SELECTED_NAMESPACE" != "ALL_NAMESPACES" ]; then
             break
         fi
 
-        echo "Invalid selection. Selection is mandatory."
+        echo "Invalid selection. Please select a valid number."
 
     done
 
@@ -105,13 +101,69 @@ fi
 while true; do
 
     echo ""
-    read -rp "Enter Search Value (Flow ID / Transaction ID / Keyword): " SEARCH_VALUE
 
-    if [ -n "$SEARCH_VALUE" ]; then
-        break
-    fi
+    read -r -p "Enter Search Value (FlowId / TransactionId / RequestId): " SEARCH_VALUE
+
+    [ -n "$SEARCH_VALUE" ] && break
 
     echo "Search value is mandatory."
+
+done
+
+###############################################################################
+# TIME RANGE SELECTION
+###############################################################################
+
+while true; do
+
+    echo ""
+    echo "Select Time Range"
+    echo "---------------------------------------------------------------"
+    echo "1) Last 15 Minutes"
+    echo "2) Last 1 Hour"
+    echo "3) Last 6 Hours"
+    echo "4) Last 24 Hours"
+    echo "5) Last 7 Days"
+    echo "6) All Available Logs"
+    echo ""
+
+    read -r -p "Select Option: " TIME_CHOICE
+
+    case "$TIME_CHOICE" in
+        1)
+            LOG_TIME_ARG="--since=15m"
+            TIME_TEXT="Last 15 Minutes"
+            break
+            ;;
+        2)
+            LOG_TIME_ARG="--since=1h"
+            TIME_TEXT="Last 1 Hour"
+            break
+            ;;
+        3)
+            LOG_TIME_ARG="--since=6h"
+            TIME_TEXT="Last 6 Hours"
+            break
+            ;;
+        4)
+            LOG_TIME_ARG="--since=24h"
+            TIME_TEXT="Last 24 Hours"
+            break
+            ;;
+        5)
+            LOG_TIME_ARG="--since=168h"
+            TIME_TEXT="Last 7 Days"
+            break
+            ;;
+        6)
+            LOG_TIME_ARG=""
+            TIME_TEXT="All Available Logs"
+            break
+            ;;
+        *)
+            echo "Invalid selection."
+            ;;
+    esac
 
 done
 
@@ -131,22 +183,27 @@ else
 fi
 
 ###############################################################################
-# START SCAN
+# SUMMARY
 ###############################################################################
 
 echo ""
-echo "============================================================"
-echo "SCAN CONFIGURATION"
-echo "============================================================"
+echo "==============================================================="
+echo "Scan Configuration"
+echo "==============================================================="
 echo "Namespace : $SELECTED_NAMESPACE"
 
 if [ "$SELECTED_NAMESPACE" != "ALL_NAMESPACES" ]; then
     echo "Pod       : $SELECTED_POD"
 fi
 
+echo "Time      : $TIME_TEXT"
 echo "Search    : $SEARCH_VALUE"
-echo "============================================================"
+echo "==============================================================="
 echo ""
+
+###############################################################################
+# START SCAN
+###############################################################################
 
 MATCH_FOUND=0
 
@@ -154,7 +211,7 @@ for NS in $NAMESPACE_LIST; do
 
     echo ""
     echo "Scanning Namespace: $NS"
-    echo "------------------------------------------------------------"
+    echo "---------------------------------------------------------------"
 
     if [ "$SELECTED_NAMESPACE" != "ALL_NAMESPACES" ] &&
        [ "$SELECTED_POD" != "ALL_PODS" ]; then
@@ -165,42 +222,48 @@ for NS in $NAMESPACE_LIST; do
 
         POD_LIST=$(kubectl get pods -n "$NS" \
             -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
-
     fi
 
     for POD in $POD_LIST; do
 
-        echo "Checking Pod: $POD"
-
         CONTAINERS=$(kubectl get pod "$POD" -n "$NS" \
-            -o jsonpath='{.spec.containers[*].name}')
+            -o jsonpath='{.spec.containers[*].name}' 2>/dev/null)
+
+        [ -z "$CONTAINERS" ] && continue
 
         for CONTAINER in $CONTAINERS; do
 
-            echo "  Container: $CONTAINER"
+            echo "Checking: $NS / $POD / $CONTAINER"
 
-            MATCHES=$(kubectl logs \
-                "$POD" \
-                -n "$NS" \
-                -c "$CONTAINER" \
-                --tail=-1 \
-                2>/dev/null | grep -i "$SEARCH_VALUE" || true)
+            LOG_RESULT=$(
+                kubectl logs \
+                    "$POD" \
+                    -n "$NS" \
+                    -c "$CONTAINER" \
+                    $LOG_TIME_ARG \
+                    2>/dev/null | \
+                grep -i -C 20 -- "$SEARCH_VALUE" || true
+            )
 
-            if [ -n "$MATCHES" ]; then
+            if [ -n "$LOG_RESULT" ]; then
 
                 MATCH_FOUND=1
 
                 echo ""
-                echo "************************************************************"
-                echo "MATCH FOUND"
+                echo "###############################################################"
+                echo "# MATCH FOUND"
+                echo "###############################################################"
                 echo "Namespace : $NS"
                 echo "Pod       : $POD"
                 echo "Container : $CONTAINER"
-                echo "************************************************************"
+                echo "Search    : $SEARCH_VALUE"
+                echo "###############################################################"
+                echo ""
 
-                echo "$MATCHES"
+                echo "$LOG_RESULT"
 
-                echo "************************************************************"
+                echo ""
+                echo "###############################################################"
                 echo ""
 
             fi
@@ -212,18 +275,12 @@ for NS in $NAMESPACE_LIST; do
 done
 
 ###############################################################################
-# SUMMARY
+# FINAL SUMMARY
 ###############################################################################
 
 echo ""
-echo "============================================================"
+echo "==============================================================="
 echo "SCAN COMPLETED"
-echo "============================================================"
+echo "==============================================================="
 
-if [ "$MATCH_FOUND" -eq 0 ]; then
-    echo "No matches found for: $SEARCH_VALUE"
-else
-    echo "Search completed successfully."
-fi
-
-echo "============================================================"
+if [ "
