@@ -137,12 +137,20 @@ if [ "$WANT_LIVE_LOGS" = "y" ] && [ -n "${LIVE_NS:-}" ] && [ -n "${LIVE_POD:-}" 
     echo " Press Ctrl+C to stop watching. No scan will run."
     echo "============================================================"
     echo ""
-    trap 'echo ""; echo "Stopped watching logs. Exiting (no scan was run)."; exit 0' INT
+    # NOTE: the trap does not call exit -- exit inside a trap always
+    # terminates the whole process, not just this loop iteration, which
+    # would defeat "return to the first question" below. It just prints
+    # and returns; kubectl logs -f itself receives the same SIGINT and
+    # terminates on its own, so execution naturally continues to the
+    # "continue" statement right after either way (Ctrl+C or a natural
+    # end of the log stream).
+    trap 'echo ""; echo "Stopped watching logs."' INT
     kubectl logs -f -n "$LIVE_NS" "$LIVE_POD" --all-containers --timestamps
     trap - INT
     echo ""
-    echo "Log stream ended (pod may have restarted or the container exited). Exiting (no scan was run)."
-    exit 0
+    echo "Log stream ended (pod may have restarted or the container exited)."
+    echo "Returning to the first question..."
+    continue
 fi
 
 ###############################################################################
@@ -178,64 +186,121 @@ echo ""
 echo "------------------------------------------------------------"
 echo "2. SCAN SCOPE"
 echo "------------------------------------------------------------"
-echo "Scan the full infrastructure, or only specific pods?"
-echo ""
 
-# Allow non-interactive override via env var (for cron / CI use):
-# a comma- or space-separated list of literal "namespace/podname"
-# entries, or "all"/"full" to force a full scan without prompting.
-SCAN_PODS="${SCAN_PODS:-}"
+# Two-level picker: namespace first (with an ALL NAMESPACES option), then
+# -- only if a specific namespace was chosen -- pods within that one
+# namespace (with an ALL PODS option). Choosing ALL NAMESPACES scans
+# everything and skips the pod-narrowing step entirely, same as the
+# companion log-search tool's scope picker.
+#
+# Non-interactive overrides (for cron / CI use):
+#   SCAN_NAMESPACE       "all"/"full", or a literal namespace name
+#   SCAN_POD_SELECTION   "all", or a comma-separated list of literal pod
+#                         names within that namespace (ignored when
+#                         SCAN_NAMESPACE is "all"/"full")
+SCAN_NAMESPACE="${SCAN_NAMESPACE:-}"
+SCAN_POD_SELECTION="${SCAN_POD_SELECTION:-}"
+SELECTED_NS=""
 SELECTED_PODS=""
 SCOPE_MODE="FULL"
 
-if [ -n "$SCAN_PODS" ] && [ "$SCAN_PODS" != "all" ] && [ "$SCAN_PODS" != "full" ]; then
-    SELECTED_PODS=$(echo "$SCAN_PODS" | tr ',' ' ')
-    SCOPE_MODE="SELECTED"
-    echo "Scan scope set via SCAN_PODS env var: $SELECTED_PODS"
+if [ -n "$SCAN_NAMESPACE" ] && [ "$SCAN_NAMESPACE" != "all" ] && [ "$SCAN_NAMESPACE" != "full" ]; then
+    SELECTED_NS="$SCAN_NAMESPACE"
+    echo "Namespace scope set via SCAN_NAMESPACE env var: $SELECTED_NS"
+elif [ -n "$SCAN_NAMESPACE" ]; then
+    echo "Namespace scope set via SCAN_NAMESPACE env var: ALL NAMESPACES"
 elif [ -t 0 ]; then
-    read -r -p "Enter [F]ull infrastructure or [S]pecific pods [default: Full]: " SCOPE_CHOICE
-    case "$SCOPE_CHOICE" in
-        [Ss]*)
-            echo ""
-            echo "Discovering pods across all namespaces..."
-            POD_DISCOVERY=$(kubectl get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"\n"}{end}' 2>/dev/null | sort)
-            if [ -z "$POD_DISCOVERY" ]; then
-                echo "Could not list pods (cluster not reachable yet, or kubectl unavailable)."
-                echo "Defaulting to FULL SCAN -- connectivity will be verified in the next step."
-            else
-                POD_ARRAY=()
-                while IFS= read -r pod_entry; do
-                    [ -n "$pod_entry" ] && POD_ARRAY+=("$pod_entry")
-                done <<< "$POD_DISCOVERY"
-                echo ""
-                for i in "${!POD_ARRAY[@]}"; do
-                    printf "  %d. %s\n" "$((i+1))" "${POD_ARRAY[$i]}"
-                done
-                echo ""
-                read -r -p "Enter numbers to scan, comma-separated (e.g. 1,3) [default: Full scan]: " POD_SELECTION
-                if [ -n "$POD_SELECTION" ]; then
-                    PICKED=""
-                    IFS=',' read -ra POD_NUMS <<< "$POD_SELECTION"
-                    for n in "${POD_NUMS[@]}"; do
-                        n=$(echo "$n" | tr -d '[:space:]')
-                        case "$n" in ''|*[!0-9]*) continue ;; esac
-                        idx=$((n-1))
-                        if [ "$idx" -ge 0 ] && [ "$idx" -lt "${#POD_ARRAY[@]}" ]; then
-                            PICKED="$PICKED ${POD_ARRAY[$idx]}"
-                        fi
-                    done
-                    PICKED=$(echo "$PICKED" | sed 's/^ *//')
-                    if [ -n "$PICKED" ]; then
-                        SELECTED_PODS="$PICKED"
-                        SCOPE_MODE="SELECTED"
+    echo "Discovering namespaces..."
+    NS_DISCOVERY=$(kubectl get namespaces -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | sort)
+    if [ -z "$NS_DISCOVERY" ]; then
+        echo "Could not list namespaces (cluster not reachable yet, or kubectl unavailable)."
+        echo "Defaulting to FULL SCAN -- connectivity will be verified in the next step."
+    else
+        NS_ARRAY=()
+        while IFS= read -r ns_name; do
+            [ -n "$ns_name" ] && NS_ARRAY+=("$ns_name")
+        done <<< "$NS_DISCOVERY"
+        echo ""
+        echo "  0. ALL NAMESPACES"
+        for i in "${!NS_ARRAY[@]}"; do
+            printf "  %d. %s\n" "$((i+1))" "${NS_ARRAY[$i]}"
+        done
+        echo ""
+        read -r -p "Enter a namespace number [default: 0 = ALL NAMESPACES]: " NS_CHOICE
+        if [ -n "$NS_CHOICE" ] && [ "$NS_CHOICE" != "0" ]; then
+            case "$NS_CHOICE" in
+                *[!0-9]*)
+                    echo "Invalid selection -- defaulting to ALL NAMESPACES."
+                    ;;
+                *)
+                    if [ "$NS_CHOICE" -ge 1 ] 2>/dev/null && [ "$NS_CHOICE" -le "${#NS_ARRAY[@]}" ] 2>/dev/null; then
+                        SELECTED_NS="${NS_ARRAY[$((NS_CHOICE-1))]}"
                     else
-                        echo "No valid pod numbers recognized -- defaulting to FULL SCAN."
+                        echo "Number out of range -- defaulting to ALL NAMESPACES."
                     fi
+                    ;;
+            esac
+        fi
+    fi
+fi
+
+if [ -n "$SELECTED_NS" ]; then
+    echo ""
+    echo "------------------------------------------------------------"
+    echo "2b. SELECT POD(S) IN NAMESPACE: $SELECTED_NS"
+    echo "------------------------------------------------------------"
+
+    if [ -n "$SCAN_POD_SELECTION" ] && [ "$SCAN_POD_SELECTION" != "all" ]; then
+        SELECTED_PODS=$(echo "$SCAN_POD_SELECTION" | tr ',' ' ')
+        SCOPE_MODE="NAMESPACE_SELECTED"
+        echo "Pod scope set via SCAN_POD_SELECTION env var: $SELECTED_PODS"
+    elif [ -n "$SCAN_POD_SELECTION" ]; then
+        SCOPE_MODE="NAMESPACE_ALL_PODS"
+        echo "Pod scope set via SCAN_POD_SELECTION env var: ALL PODS in $SELECTED_NS"
+    elif [ -t 0 ]; then
+        POD_DISCOVERY=$(kubectl get pods -n "$SELECTED_NS" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | sort)
+        if [ -z "$POD_DISCOVERY" ]; then
+            echo "No pods found in namespace '$SELECTED_NS' (or cluster not reachable)."
+            echo "Defaulting to ALL PODS in this namespace -- will simply find nothing to scan if truly empty."
+            SCOPE_MODE="NAMESPACE_ALL_PODS"
+        else
+            POD_ARRAY=()
+            while IFS= read -r pod_entry; do
+                [ -n "$pod_entry" ] && POD_ARRAY+=("$pod_entry")
+            done <<< "$POD_DISCOVERY"
+            echo ""
+            echo "  0. ALL PODS in $SELECTED_NS"
+            for i in "${!POD_ARRAY[@]}"; do
+                printf "  %d. %s\n" "$((i+1))" "${POD_ARRAY[$i]}"
+            done
+            echo ""
+            read -r -p "Enter pod number(s), comma-separated, or 0 for all [default: 0 = ALL PODS]: " POD_SELECTION
+            if [ -n "$POD_SELECTION" ] && [ "$POD_SELECTION" != "0" ]; then
+                PICKED=""
+                IFS=',' read -ra POD_NUMS <<< "$POD_SELECTION"
+                for n in "${POD_NUMS[@]}"; do
+                    n=$(echo "$n" | tr -d '[:space:]')
+                    case "$n" in ''|*[!0-9]*) continue ;; esac
+                    idx=$((n-1))
+                    if [ "$idx" -ge 0 ] && [ "$idx" -lt "${#POD_ARRAY[@]}" ]; then
+                        PICKED="$PICKED ${POD_ARRAY[$idx]}"
+                    fi
+                done
+                PICKED=$(echo "$PICKED" | sed 's/^ *//')
+                if [ -n "$PICKED" ]; then
+                    SELECTED_PODS="$PICKED"
+                    SCOPE_MODE="NAMESPACE_SELECTED"
+                else
+                    echo "No valid pod numbers recognized -- defaulting to ALL PODS in $SELECTED_NS."
+                    SCOPE_MODE="NAMESPACE_ALL_PODS"
                 fi
+            else
+                SCOPE_MODE="NAMESPACE_ALL_PODS"
             fi
-            ;;
-        *) : ;;   # anything else (including empty) -> full scan, the default
-    esac
+        fi
+    else
+        SCOPE_MODE="NAMESPACE_ALL_PODS"
+    fi
 fi
 
 echo ""
@@ -263,12 +328,23 @@ SCAN_START_EPOCH=$((SCAN_END_EPOCH - SCAN_MINUTES*60))
 SCAN_START_HUMAN=$(date -d "@$SCAN_START_EPOCH" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -r "$SCAN_START_EPOCH" '+%Y-%m-%d %H:%M:%S')
 SCAN_END_HUMAN=$(date -d "@$SCAN_END_EPOCH" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -r "$SCAN_END_EPOCH" '+%Y-%m-%d %H:%M:%S')
 
+# Shared scope description, used everywhere (Confirm Scan, FINAL SUMMARY,
+# HTML report, README) so the three scope modes are described consistently
+# in exactly one place.
+scope_description() {
+    case "$SCOPE_MODE" in
+        NAMESPACE_ALL_PODS) echo "Namespace '$SELECTED_NS', ALL pods" ;;
+        NAMESPACE_SELECTED) echo "Namespace '$SELECTED_NS', pod(s):$SELECTED_PODS" ;;
+        *) echo "Full infrastructure (all namespaces, all pods)" ;;
+    esac
+}
+
 echo ""
 echo "------------------------------------------------------------"
 echo "4. CONFIRM SCAN"
 echo "------------------------------------------------------------"
 echo "Time range : last ${SCAN_MINUTES} minutes (${SCAN_START_HUMAN} -> ${SCAN_END_HUMAN})"
-echo "Scope      : $([ "$SCOPE_MODE" = "SELECTED" ] && echo "Selected pods -${SELECTED_PODS}" || echo "Full infrastructure (all pods)")"
+echo "Scope      : $(scope_description)"
 echo "Search     : ${SEARCH_VALUE:-<none, full scan>}"
 echo "Mode       : ${SEARCH_MODE}"
 echo ""
@@ -669,15 +745,17 @@ section "PRECHECK"
 
 if ! command_exists kubectl; then
     echo "ERROR: kubectl is not installed or not in PATH."
-    exit 1
+    echo "Returning to the first question -- fix this and try again, or Ctrl+C to exit."
+    continue
 fi
 
 if ! kubectl cluster-info >/dev/null 2>&1; then
     critical "Cannot connect to Kubernetes API server."
     fix "Check kubeconfig: kubectl config current-context"
     fix "Check connectivity: kubectl cluster-info"
-    echo "Cannot connect to the Kubernetes API. Aborting (nothing was changed)." 
-    exit 1
+    echo "Cannot connect to the Kubernetes API. Nothing was changed."
+    echo "Returning to the first question -- this may be transient; try again, or Ctrl+C to exit."
+    continue
 fi
 
 CURRENT_CONTEXT=$(kubectl config current-context 2>/dev/null)
@@ -1011,17 +1089,25 @@ fi
 # Service routing to this pod healthy?") at negligible extra cost,
 # without needing full ownerReference resolution up front.
 selected_pods_in_ns() {
-    # $1 = namespace -> prints the selected pod names in that namespace, one per line
-    local ns="$1"
-    echo "$SELECTED_PODS" | tr ' ' '\n' | awk -F'/' -v ns="$ns" '$1==ns {print $2}'
+    # SELECTED_PODS is already scoped to the single chosen namespace
+    # (SELECTED_NS) by construction with the namespace-first picker, so
+    # this no longer needs a namespace argument or any "ns/pod" splitting.
+    echo "$SELECTED_PODS" | tr ' ' '\n'
 }
 
-if [ "$SCOPE_MODE" = "SELECTED" ] && [ -n "$SELECTED_PODS" ]; then
-    NAMESPACE_LIST=$(echo "$SELECTED_PODS" | tr ' ' '\n' | awk -F'/' '{print $1}' | sort -u)
-    info "Scan scope restricted to selected pod(s): $SELECTED_PODS"
-else
-    NAMESPACE_LIST=$(kubectl get namespaces -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
-fi
+case "$SCOPE_MODE" in
+    NAMESPACE_ALL_PODS)
+        NAMESPACE_LIST="$SELECTED_NS"
+        info "Scan scope restricted to namespace: $SELECTED_NS (all pods)"
+        ;;
+    NAMESPACE_SELECTED)
+        NAMESPACE_LIST="$SELECTED_NS"
+        info "Scan scope restricted to namespace: $SELECTED_NS, pod(s): $SELECTED_PODS"
+        ;;
+    *)
+        NAMESPACE_LIST=$(kubectl get namespaces -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+        ;;
+esac
 
 REDIS_FOUND=0
 
@@ -1193,8 +1279,8 @@ for NS in $NAMESPACE_LIST; do
 
     # --- Pods ---
     POD_LIST=$(kubectl get pods -n "$NS" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
-    if [ "$SCOPE_MODE" = "SELECTED" ]; then
-        ALLOWED_PODS=$(selected_pods_in_ns "$NS")
+    if [ "$SCOPE_MODE" = "NAMESPACE_SELECTED" ]; then
+        ALLOWED_PODS=$(selected_pods_in_ns)
         POD_LIST=$(echo "$POD_LIST" | while read -r p; do
             [ -z "$p" ] && continue
             echo "$ALLOWED_PODS" | grep -qx "$p" && echo "$p"
@@ -1997,7 +2083,7 @@ FINAL SUMMARY
 ====================================================================
 Context        : $CURRENT_CONTEXT
 Scan window    : last ${SCAN_MINUTES} min ($SCAN_START_HUMAN -> $SCAN_END_HUMAN)
-Scope          : $([ "$SCOPE_MODE" = "SELECTED" ] && echo "Selected pods -${SELECTED_PODS}" || echo "Full infrastructure (all pods)")
+Scope          : $(scope_description)
 Search         : ${SEARCH_VALUE:-<full scan>}  (sources: $MATCHES, occurrences: $SEARCH_OCCURRENCES, resources: $SEARCH_RESOURCES, namespaces: $SEARCH_NAMESPACES)
 Control plane  : $CONTROL_PLANE_STATUS
 Redis          : $REDIS_STATUS
@@ -2034,7 +2120,7 @@ EOF
 # into HTML unescaped. ---
 HTML_CONTEXT=$(printf '%s' "$CURRENT_CONTEXT" | html_escape)
 HTML_SEARCH=$(printf '%s' "${SEARCH_VALUE:-Full scan}" | html_escape)
-HTML_SCOPE=$(printf '%s' "$([ "$SCOPE_MODE" = "SELECTED" ] && echo "Selected pods: ${SELECTED_PODS}" || echo "Full infrastructure")" | html_escape)
+HTML_SCOPE=$(printf '%s' "$(scope_description)" | html_escape)
 
 # --- Build a self-contained HTML report ---
 {
@@ -2114,8 +2200,31 @@ table{font-size:13px} th{color:#9aa0aa;font-weight:600}
 HTML_HEAD
 
 if [ -n "$SEARCH_VALUE" ] && [ -s "$MATCH_REPORT" ]; then
-    echo '<h2>Search Matches (with context)</h2><div class="card"><pre>'
-    sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' "$MATCH_REPORT"
+    echo '<h2>Search Matches (with context)</h2>'
+    echo '<p style="color:#9aa0aa;font-size:13px">Occurrences of your search term are highlighted <mark style="background:#ffd166;color:#0f1115;padding:0 2px;border-radius:2px;">like this</mark>.</p>'
+    echo '<div class="card"><pre>'
+    # Highlight is applied AFTER html-escaping, using awk's index()/substr()
+    # for a purely literal (non-regex) substring replace -- the search term
+    # can contain any characters (., *, [, etc.) without needing regex
+    # escaping, consistent with how the search itself uses grep -F. The
+    # term used for matching is escaped with the SAME html_escape() as the
+    # surrounding text, so it correctly finds itself inside already-escaped
+    # content (e.g. searching for "a&b" must match the "a&amp;b" that's
+    # actually in the escaped stream).
+    HTML_SEARCH_TERM=$(printf '%s' "$SEARCH_VALUE" | html_escape)
+    sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' "$MATCH_REPORT" | \
+        awk -v term="$HTML_SEARCH_TERM" '
+        {
+            line = $0
+            tlen = length(term)
+            if (tlen == 0) { print line; next }
+            result = ""
+            while ((idx = index(line, term)) > 0) {
+                result = result substr(line, 1, idx-1) "<mark style=\"background:#ffd166;color:#0f1115;padding:0 2px;border-radius:2px;\">" substr(line, idx, tlen) "</mark>"
+                line = substr(line, idx + tlen)
+            }
+            print result line
+        }'
     echo '</pre></div>'
 fi
 
@@ -2321,7 +2430,7 @@ Developed by Shady Gomaa
 Context   : $CURRENT_CONTEXT
 Generated : $(timestamp)
 Window    : last ${SCAN_MINUTES} min ($SCAN_START_HUMAN -> $SCAN_END_HUMAN)
-Scope     : $([ "$SCOPE_MODE" = "SELECTED" ] && echo "Selected pods -${SELECTED_PODS}" || echo "Full infrastructure (all pods)")
+Scope     : $(scope_description)
 Search    : ${SEARCH_VALUE:-<full scan>}  (sources: $MATCHES, occurrences: $SEARCH_OCCURRENCES, resources: $SEARCH_RESOURCES, namespaces: $SEARCH_NAMESPACES)
 
 Open index.html in a browser for the visual report (fully offline, no
