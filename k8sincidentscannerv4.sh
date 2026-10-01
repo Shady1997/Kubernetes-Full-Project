@@ -49,23 +49,46 @@
 
 set +e
 
-# Decorative banner, drawn once on the very first run only -- not repeated
-# on every loop iteration below, which would just be noise.
+# Startup banner, drawn once on the very first run only -- not repeated on
+# every loop iteration below, and not repeated anywhere else in the script
+# or its reports. Block-letter art with an orange -> yellow gradient on a
+# color terminal; plain block letters when output is not a TTY.
 print_first_run_banner() {
-    local width=54 border="" i
-    for ((i=0; i<width; i++)); do border+="═"; done
-    echo "╔${border}╗"
-    printf '║%*s║\n' "$width" ''
-    local lines=("K U B E R N E T E S   S C A N N E R" "" "C r e a t e d   b y" "S H A D Y   G O M A A")
-    local text total pad right
-    for text in "${lines[@]}"; do
-        total=${#text}
-        pad=$(( (width - total) / 2 ))
-        right=$(( width - total - pad ))
-        printf '║%*s%s%*s║\n' "$pad" '' "$text" "$right" ''
+    local -A G=(
+        [S]="█████/█    /█████/    █/█████"
+        [H]="█   █/█   █/█████/█   █/█   █"
+        [A]=" ███ /█   █/█████/█   █/█   █"
+        [D]="████ /█   █/█   █/█   █/████ "
+        [Y]="█   █/ █ █ /  █  /  █  /  █  "
+        [G]=" ████/█    /█  ██/█   █/ ███ "
+        [O]=" ███ /█   █/█   █/█   █/ ███ "
+        [M]="█   █/██ ██/█ █ █/█   █/█   █"
+        [_]="   /   /   /   /   "
+    )
+    local text="SHADY_GOMAA" colors=(202 208 208 214 220) r i ch line
+    local -a rows
+    local use_color=0
+    [ -t 1 ] && use_color=1
+
+    echo ""
+    if [ "$use_color" -eq 1 ]; then
+        printf '  \033[38;5;245mdeveloped by\033[0m\n\n'
+    else
+        printf '  developed by\n\n'
+    fi
+    for r in 0 1 2 3 4; do
+        line=""
+        for ((i=0; i<${#text}; i++)); do
+            ch="${text:i:1}"
+            IFS='/' read -ra rows <<< "${G[$ch]}"
+            line+="${rows[r]} "
+        done
+        if [ "$use_color" -eq 1 ]; then
+            printf '  \033[38;5;%sm%s\033[0m\n' "${colors[r]}" "$line"
+        else
+            printf '  %s\n' "$line"
+        fi
     done
-    printf '║%*s║\n' "$width" ''
-    echo "╚${border}╝"
     echo ""
 }
 
@@ -105,7 +128,6 @@ fi
 echo "============================================================"
 echo " KUBERNETES INCIDENT DIAGNOSTIC SCANNER v3"
 echo " Offline / Read-Only / Non-Mutating"
-echo " Developed by Shady Gomaa"
 echo "============================================================"
 echo ""
 echo "No internet connection is required."
@@ -2213,7 +2235,7 @@ HTML_SCOPE=$(printf '%s' "$(scope_description)" | html_escape)
 {
 cat <<HTML_HEAD
 <!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>K8s Incident Report - $HTML_CONTEXT | by Shady Gomaa</title>
+<html><head><meta charset="utf-8"><title>K8s Incident Report - $HTML_CONTEXT</title>
 <style>
 body{font-family:-apple-system,Segoe UI,Arial,sans-serif;background:#0f1115;color:#e6e6e6;margin:0;padding:24px;}
 h1{margin-top:0} h2{border-bottom:1px solid #333;padding-bottom:6px;margin-top:32px}
@@ -2224,8 +2246,6 @@ h1{margin-top:0} h2{border-bottom:1px solid #333;padding-bottom:6px;margin-top:3
 pre{background:#0b0d11;border:1px solid #2a2d36;border-radius:6px;padding:12px;overflow-x:auto;white-space:pre-wrap;font-size:12px}
 .badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:12px;margin-left:8px}
 .badge.crit{background:#3a1414}.badge.err{background:#3a2414}.badge.warn{background:#3a3414}.badge.ok{background:#123a2c}
-.masthead{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px}
-.dev-credit{color:#9aa0aa;font-size:13px}
 table{font-size:13px} th{color:#9aa0aa;font-weight:600}
 .timeline{position:relative;margin-left:12px;padding-left:20px;border-left:2px solid #2a2d36}
 .tl-item{position:relative;margin-bottom:14px}
@@ -2233,10 +2253,7 @@ table{font-size:13px} th{color:#9aa0aa;font-weight:600}
 .tl-item.crit::before{background:#ff5c5c} .tl-item.err::before{background:#ff8c42} .tl-item.warn::before{background:#ffd166}
 .tl-time{color:#9aa0aa;font-size:12px;margin-right:8px}
 </style></head><body>
-<div class="masthead">
 <h1>Kubernetes Incident Diagnostic Report</h1>
-<div class="dev-credit">Developed by <b>Shady Gomaa</b></div>
-</div>
 <div class="card">
 <div class="grid">
 <div><div class="label">Context</div><div class="stat" style="font-size:16px">$HTML_CONTEXT</div></div>
@@ -2503,17 +2520,12 @@ CPU throttling                    : NOT detectable by this scanner. A container 
 Pod CPU/memory usage              : a SINGLE-SAMPLE reading from Metrics Server at scan time, not a trend -- a pod that briefly spikes to 95% of its limit moments before or after this scan runs will not be caught, and a pod caught mid-spike may look worse than its typical behavior. High usage vs. limit is a leading indicator, not a confirmed diagnosis; corroborate with repeat runs, or run 'kubectl top pod --containers' several times a few seconds apart, or use a monitoring system for a real trend.
 </pre></div>
 
-<div style="text-align:center;color:#5a5f6a;font-size:12px;margin:30px 0 10px">
-Kubernetes Incident Diagnostic Scanner -- developed by Shady Gomaa
-</div>
-
 </body></html>
 HTML_TAIL
 } > "$HTML_REPORT"
 
 cat > "$REPORT_DIR/README.txt" <<EOF
 Kubernetes Incident Diagnostic Report
-Developed by Shady Gomaa
 Context   : $CURRENT_CONTEXT
 Generated : $(timestamp)
 Window    : last ${SCAN_MINUTES} min ($SCAN_START_HUMAN -> $SCAN_END_HUMAN)
