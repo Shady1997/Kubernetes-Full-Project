@@ -2571,3 +2571,10 @@ echo "Report directory : $REPORT_DIR"
 echo "HTML report       : $HTML_REPORT"
 echo ""
 echo "No Kubernetes resource was modified by this scan."
+
+echo ""
+echo "===================================================================="
+echo "Returning to the first question... (Ctrl+C to exit)"
+echo "===================================================================="
+
+done
