@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 ###############################################################################
-# Kubernetes Incident Diagnostic Scanner v3
+# Kubernetes Incident Diagnostic Scanner v4
 #
 # READ-ONLY / NON-MUTATING KUBERNETES RESOURCE SCANNER.
 # (Not "zero side effects": see the kubectl exec note below.)
@@ -126,12 +126,8 @@ if [ "$FIRST_RUN" = "1" ]; then
 fi
 
 echo "============================================================"
-echo " KUBERNETES INCIDENT DIAGNOSTIC SCANNER v3"
-echo " Offline / Read-Only / Non-Mutating"
+echo " KUBERNETES INCIDENT DIAGNOSTIC SCANNER v4"
 echo "============================================================"
-echo ""
-echo "No internet connection is required."
-echo "No Kubernetes resources will be modified."
 echo ""
 
 ###############################################################################
