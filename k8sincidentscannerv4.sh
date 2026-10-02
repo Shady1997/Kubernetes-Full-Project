@@ -106,6 +106,13 @@ ORIG_REPORT_DIR="${REPORT_DIR:-}"
 
 FIRST_RUN=1
 
+# The script returns to the first question after every scan. That is only
+# wanted in an interactive terminal. When stdin is not a terminal (cron, CI,
+# `< /dev/null`) or RUN_ONCE=1 is set, the script exits after ONE run instead
+# of re-running the same scan forever.
+RUN_ONCE="${RUN_ONCE:-0}"
+should_exit_after_run() { [ "$RUN_ONCE" = "1" ] || [ ! -t 0 ]; }
+
 # The whole script body runs inside this loop: after a scan (or a live-log
 # session) finishes, execution falls through to "done" at the very bottom
 # and loops back here -- no need to relaunch the script. Ctrl+C at any
@@ -254,6 +261,7 @@ if [ "$WANT_LIVE_LOGS" = "y" ] && [ -n "${LIVE_NS:-}" ] && [ -n "${LIVE_POD:-}" 
     trap - INT
     echo ""
     echo "Log stream ended (pod may have restarted or the container exited)."
+    if should_exit_after_run; then exit 0; fi
     echo "Returning to the first question..."
     continue
 fi
@@ -874,6 +882,7 @@ section "PRECHECK"
 
 if ! command_exists kubectl; then
     echo "ERROR: kubectl is not installed or not in PATH."
+    if should_exit_after_run; then exit 1; fi
     echo "Returning to the first question -- fix this and try again, or Ctrl+C to exit."
     continue
 fi
@@ -883,6 +892,7 @@ if ! kubectl cluster-info >/dev/null 2>&1; then
     fix "Check kubeconfig: kubectl config current-context"
     fix "Check connectivity: kubectl cluster-info"
     echo "Cannot connect to the Kubernetes API. Nothing was changed."
+    if should_exit_after_run; then exit 1; fi
     echo "Returning to the first question -- this may be transient; try again, or Ctrl+C to exit."
     continue
 fi
@@ -1177,12 +1187,28 @@ TOTAL_RETAINED_EVENTS=${TOTAL_RETAINED_EVENTS:-0}
 EVENTS_IN_WINDOW=$(awk -F'\t' -v s="$SCAN_START_UTC" -v e="$SCAN_END_UTC" '$1!="" && $1>=s && $1<=e' "$REPORT_DIR/data/events_raw.tsv" 2>/dev/null | wc -l | tr -d ' ')
 EVENTS_IN_WINDOW=${EVENTS_IN_WINDOW:-0}
 
-awk -F'\t' -v s="$SCAN_START_UTC" -v e="$SCAN_END_UTC" -v OFS='\t' '$1!="" && $1>=s && $1<=e && $2=="Warning"' \
+# When a single namespace was selected, only that namespace's events (plus
+# cluster-level events with no namespace, e.g. node events) are listed.
+awk -F'\t' -v s="$SCAN_START_UTC" -v e="$SCAN_END_UTC" -v sel="$SELECTED_NS" -v OFS='\t' \
+    '$1!="" && $1>=s && $1<=e && $2=="Warning" && (sel=="" || $3=="" || $3==sel)' \
     "$REPORT_DIR/data/events_raw.tsv" > "$REPORT_DIR/data/warning-events-in-window.tsv" 2>/dev/null
 WARN_EVT_COUNT=$(wc -l < "$REPORT_DIR/data/warning-events-in-window.tsv" 2>/dev/null | tr -d ' ')
 WARN_EVT_COUNT=${WARN_EVT_COUNT:-0}
 
-[ "$WARN_EVT_COUNT" -gt 0 ] 2>/dev/null && warn "Found $WARN_EVT_COUNT Warning event(s) with lastTimestamp inside the requested ${SCAN_MINUTES}-minute window (of $TOTAL_RETAINED_EVENTS total events currently retained by the API server)."
+if [ "$WARN_EVT_COUNT" -gt 0 ] 2>/dev/null; then
+    warn "Found $WARN_EVT_COUNT Warning event(s) inside the requested ${SCAN_MINUTES}-minute window${SELECTED_NS:+ for namespace $SELECTED_NS (plus cluster-level events)} (of $TOTAL_RETAINED_EVENTS total events currently retained by the API server)."
+    echo "    Most recent Warning events (newest first, max 15; full list in errors-and-warnings.txt):"
+    sort -t$'\t' -k1,1r "$REPORT_DIR/data/warning-events-in-window.tsv" | head -15 | awk -F'\t' '{
+        ts=$1; sub(/^[0-9-]+T/, "", ts); sub(/Z$/, "", ts)
+        msg=$6; if (length(msg) > 160) msg=substr(msg, 1, 157) "..."
+        printf "    %s  %s/%s  [%s] %s\n", ts, ($3=="" ? "-" : $3), $4, $5, msg }' | redact
+    {
+        echo ""
+        echo "WARNING EVENTS IN WINDOW (${WARN_EVT_COUNT}), newest first:"
+        sort -t$'\t' -k1,1r "$REPORT_DIR/data/warning-events-in-window.tsv" | awk -F'\t' '{
+            printf "  %s  %s/%s  [%s] %s\n", $1, ($3=="" ? "-" : $3), $4, $5, $6 }' | redact
+    } >> "$ERROR_REPORT"
+fi
 
 info "Events: $EVENTS_IN_WINDOW of $TOTAL_RETAINED_EVENTS currently-retained events fall inside the requested window ($SCAN_START_UTC -> $SCAN_END_UTC UTC). Kubernetes Event retention is set by the cluster, not by this scanner -- older events may already be gone, so a low count here does not prove nothing happened."
 
@@ -1245,14 +1271,25 @@ for NS in $NAMESPACE_LIST; do
 
     kubectl get all -n "$NS" -o wide >> "$REPORT" 2>&1
 
+    # Workloads (Deployments + StatefulSets) with desired>0 and ZERO ready
+    # replicas are complete outages of that workload -> CRITICAL. If EVERY
+    # workload in the namespace is in that state it is a namespace outage.
+    NS_WL_TOTAL=0; NS_WL_DOWN=0
+
     # --- Deployments ---
     DEPLOYMENTS=$(kubectl get deployment -n "$NS" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
     for D in $DEPLOYMENTS; do
         DESIRED=$(kubectl get deployment "$D" -n "$NS" -o jsonpath='{.spec.replicas}' 2>/dev/null)
         READY=$(kubectl get deployment "$D" -n "$NS" -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
         READY=${READY:-0}
+        NS_WL_TOTAL=$((NS_WL_TOTAL+1))
         if [ "$READY" != "$DESIRED" ]; then
-            error "Deployment $NS/$D READY=$READY DESIRED=$DESIRED."
+            if [ "$READY" = "0" ] && [ "${DESIRED:-0}" -gt 0 ] 2>/dev/null; then
+                NS_WL_DOWN=$((NS_WL_DOWN+1))
+                critical "Deployment $NS/$D is DOWN: 0 of $DESIRED replicas ready (complete outage of this workload)."
+            else
+                error "Deployment $NS/$D READY=$READY DESIRED=$DESIRED."
+            fi
             fix "kubectl describe deployment $D -n $NS"
         fi
     done
@@ -1265,12 +1302,22 @@ for NS in $NAMESPACE_LIST; do
         SS_DESIRED=$(kubectl get statefulset "$SS" -n "$NS" -o jsonpath='{.spec.replicas}' 2>/dev/null)
         SS_READY=$(kubectl get statefulset "$SS" -n "$NS" -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
         SS_READY=${SS_READY:-0}
+        NS_WL_TOTAL=$((NS_WL_TOTAL+1))
         if [ "$SS_READY" != "$SS_DESIRED" ]; then
-            error "StatefulSet $NS/$SS READY=$SS_READY DESIRED=$SS_DESIRED."
+            if [ "$SS_READY" = "0" ] && [ "${SS_DESIRED:-0}" -gt 0 ] 2>/dev/null; then
+                NS_WL_DOWN=$((NS_WL_DOWN+1))
+                critical "StatefulSet $NS/$SS is DOWN: 0 of $SS_DESIRED replicas ready (complete outage of this workload)."
+            else
+                error "StatefulSet $NS/$SS READY=$SS_READY DESIRED=$SS_DESIRED."
+            fi
             fix "kubectl describe statefulset $SS -n $NS"
             record_fact 55 STATEFULSET_NOT_READY "$NS" "$SS" "infra-or-developer" "StatefulSet $SS: $SS_READY/$SS_DESIRED replicas ready"
         fi
     done
+
+    if [ "$NS_WL_TOTAL" -gt 0 ] && [ "$NS_WL_DOWN" -eq "$NS_WL_TOTAL" ]; then
+        critical "Namespace $NS: ALL $NS_WL_TOTAL workload(s) (Deployments/StatefulSets) have zero ready replicas -- complete namespace outage, not a partial degradation."
+    fi
 
     # --- HPA: a Deployment/StatefulSet can look perfectly healthy (all
     # desired replicas Ready) while still being the reason an app "works
@@ -1367,11 +1414,26 @@ for NS in $NAMESPACE_LIST; do
         echo "SERVICE $NS/$SVC  ClusterIP=$CLUSTER_IP  Ready=[$READY_LIST]  NotReady=[$NOTREADY_LIST]" >> "$REPORT"
 
         if [ -z "$READY_LIST" ] && [ -z "$NOTREADY_LIST" ]; then
-            error "Service $NS/$SVC (ClusterIP $CLUSTER_IP) has NO active endpoints (ready or not-ready)."
+            # Explain WHY there are no endpoints: compare the Service's selector
+            # with the pods that actually carry those labels (read-only gets).
+            SVC_SELECTOR=$(kubectl get svc "$SVC" -n "$NS" -o go-template='{{range $k,$v := .spec.selector}}{{$k}}={{$v}},{{end}}' 2>/dev/null)
+            SVC_SELECTOR="${SVC_SELECTOR%,}"
+            if [ -z "$SVC_SELECTOR" ]; then
+                SEL_NOTE="the Service defines no selector (ExternalName or manually managed Endpoints)"
+            else
+                SEL_MATCH=$(kubectl get pods -n "$NS" -l "$SVC_SELECTOR" -o name 2>/dev/null | grep -c .)
+                if [ "${SEL_MATCH:-0}" -eq 0 ] 2>/dev/null; then
+                    SEL_NOTE="selector '$SVC_SELECTOR' matches ZERO pods in namespace $NS -- label/selector mismatch, so this Service can never route traffic regardless of pod health"
+                else
+                    SEL_NOTE="selector '$SVC_SELECTOR' matches $SEL_MATCH pod(s) but none are registered as endpoints -- they are likely not Running/Ready"
+                fi
+            fi
+            error "Service $NS/$SVC (ClusterIP $CLUSTER_IP) has NO active endpoints (ready or not-ready) -- $SEL_NOTE."
             fix "kubectl describe svc $SVC -n $NS"
+            fix "kubectl get svc $SVC -n $NS -o yaml   # confirm .spec.selector"
             fix "kubectl get endpointslices -n $NS -l kubernetes.io/service-name=$SVC"
             fix "kubectl get pods -n $NS --show-labels"
-            record_fact 40 NO_ENDPOINTS "$NS" "$SVC" "developer-or-network" "Service $SVC ($CLUSTER_IP) has zero endpoints at all -- either no pod matches the selector, or all matching pods were removed"
+            record_fact 40 NO_ENDPOINTS "$NS" "$SVC" "developer-or-network" "Service $SVC ($CLUSTER_IP) has zero endpoints at all -- $SEL_NOTE"
         elif [ -z "$READY_LIST" ] && [ -n "$NOTREADY_LIST" ]; then
             error "Service $NS/$SVC (ClusterIP $CLUSTER_IP) has endpoints but NONE are Ready: $NOTREADY_LIST"
             fix "kubectl describe svc $SVC -n $NS"
@@ -1441,11 +1503,14 @@ for NS in $NAMESPACE_LIST; do
                 # the first case; conflating them under one PENDING
                 # category pointed the wrong commands at the wrong fix.
                 WAITING_REASON=$(kubectl get pod "$POD" -n "$NS" -o jsonpath='{range .status.containerStatuses[*]}{.state.waiting.reason}{" "}{end}' 2>/dev/null | sed 's/[[:space:]]*$//')
+                # The kubelet's own message names the exact missing ConfigMap /
+                # Secret / key (or the failing image), e.g. 'configmap "x" not found'.
+                WAITING_MESSAGE=$(kubectl get pod "$POD" -n "$NS" -o jsonpath='{range .status.containerStatuses[*]}{.state.waiting.message}{" | "}{end}' 2>/dev/null | tr '\t\n' '  ' | sed -e 's/[[:space:]|]*$//')
                 if [ -n "$NODE_NAME" ] && echo "$WAITING_REASON" | grep -Eqi 'ImagePullBackOff|ErrImagePull|InvalidImageName|CreateContainerConfigError|CreateContainerError'; then
-                    error "Pod $NS/$POD is Pending due to a container start error on node=$NODE_NAME (reason: $WAITING_REASON)."
+                    error "Pod $NS/$POD is Pending due to a container start error on node=$NODE_NAME (reason: $WAITING_REASON). Kubelet message: ${WAITING_MESSAGE:-<none reported>}"
                     fix "kubectl describe pod $POD -n $NS   # check Events for the exact image/config/secret error"
                     fix "kubectl get pod $POD -n $NS -o jsonpath='{.status.containerStatuses[*].state.waiting.message}'"
-                    record_fact 55 PENDING_CONTAINER_ERROR "$NS" "$POD" "developer" "Pending on node=$NODE_NAME due to a container start error ($WAITING_REASON) -- already scheduled fine; check the image reference, ConfigMap/Secret references, or registry credentials, not node capacity"
+                    record_fact 55 PENDING_CONTAINER_ERROR "$NS" "$POD" "developer" "Pending on node=$NODE_NAME due to a container start error ($WAITING_REASON) -- kubelet message: ${WAITING_MESSAGE:-none reported} -- already scheduled fine; check the image reference, ConfigMap/Secret references, or registry credentials, not node capacity"
                 else
                     error "Pod $NS/$POD is Pending. (node=${NODE_NAME:-<unscheduled>})"
                     fix "kubectl describe pod $POD -n $NS"
@@ -1812,8 +1877,25 @@ else
 fi
 
 kubectl get pvc -A -o wide >> "$REPORT" 2>&1
-PVC_PROBLEMS=$(kubectl get pvc -A --no-headers 2>/dev/null | grep -Ev 'Bound' || true)
-[ -n "$PVC_PROBLEMS" ] && { warn "PVCs not in Bound state detected."; echo "$PVC_PROBLEMS" >> "$ERROR_REPORT"; }
+PVC_PROBLEMS=$(kubectl get pvc -A --no-headers 2>/dev/null | awk '$3!="Bound"')
+if [ -n "$PVC_PROBLEMS" ]; then
+    PVC_COUNT=$(echo "$PVC_PROBLEMS" | grep -c .)
+    warn "$PVC_COUNT PVC(s) not in Bound state:"
+    { echo ""; echo "PVCs NOT BOUND ($PVC_COUNT):"; } >> "$ERROR_REPORT"
+    while read -r pvc_ns pvc_name pvc_status pvc_rest; do
+        [ -z "$pvc_name" ] && continue
+        PVC_SCOPE_NOTE=""
+        if [ -n "$SELECTED_NS" ] && [ "$pvc_ns" != "$SELECTED_NS" ]; then
+            PVC_SCOPE_NOTE="  (outside selected scope: $SELECTED_NS)"
+        fi
+        echo "    $pvc_ns/$pvc_name  status=$pvc_status$PVC_SCOPE_NOTE"
+        echo "  $pvc_ns/$pvc_name  status=$pvc_status$PVC_SCOPE_NOTE" >> "$ERROR_REPORT"
+        fix "kubectl describe pvc $pvc_name -n $pvc_ns"
+        if [ -z "$PVC_SCOPE_NOTE" ]; then
+            record_fact 55 PVC_NOT_BOUND "$pvc_ns" "$pvc_name" "infra" "PVC $pvc_name is $pvc_status (not Bound) -- check the StorageClass/provisioner and PV availability"
+        fi
+    done <<< "$PVC_PROBLEMS"
+fi
 
 ###############################################################################
 # 8. ROOT CAUSE CORRELATION ENGINE
@@ -1878,6 +1960,7 @@ suggest_cmds() {
         HPA_MAXED) echo "kubectl describe hpa $res -n $ns|kubectl top pods -n $ns|kubectl describe node   # check if there is spare node capacity for more replicas" ;;
         POD_CPU_HIGH) echo "kubectl top pod $res -n $ns --containers|kubectl get pod $res -n $ns -o jsonpath='{.spec.containers[*].resources}'|kubectl describe pod $res -n $ns   # review resources.limits.cpu" ;;
         POD_MEM_HIGH) echo "kubectl top pod $res -n $ns --containers|kubectl get pod $res -n $ns -o jsonpath='{.spec.containers[*].resources}'|kubectl describe pod $res -n $ns   # review resources.limits.memory" ;;
+        PVC_NOT_BOUND) echo "kubectl describe pvc $res -n $ns|kubectl get storageclass|kubectl get pv" ;;
         *) echo "kubectl describe pod $res -n $ns" ;;
     esac
 }
@@ -2611,6 +2694,12 @@ echo "Report directory : $REPORT_DIR"
 echo "HTML report       : $HTML_REPORT"
 echo ""
 echo "No Kubernetes resource was modified by this scan."
+
+if should_exit_after_run; then
+    echo ""
+    echo "Done (non-interactive or RUN_ONCE=1 run -- not returning to the prompt)."
+    exit 0
+fi
 
 echo ""
 echo "===================================================================="
