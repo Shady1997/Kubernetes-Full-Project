@@ -755,6 +755,30 @@ search_context() {
     fi
 }
 
+# Terminal highlight of the search keyword (black text on yellow background).
+# Reads stdin, writes stdout. Literal (non-regex) match -- same semantics as
+# the grep -F search itself -- and the term is passed via the environment so
+# awk never interprets backslashes in it. Falls back to a plain pass-through
+# when there is no search value or stdout is not a terminal, so piped/
+# redirected output never gets escape codes in it.
+highlight_term() {
+    if [ -z "$SEARCH_VALUE" ] || [ ! -t 1 ]; then
+        cat
+        return
+    fi
+    HL_TERM="$SEARCH_VALUE" awk '
+        BEGIN { term = ENVIRON["HL_TERM"]; tlen = length(term); on = "\033[30;43m"; off = "\033[0m" }
+        {
+            line = $0; out = ""
+            if (tlen == 0) { print line; next }
+            while ((i = index(line, term)) > 0) {
+                out = out substr(line, 1, i-1) on substr(line, i, tlen) off
+                line = substr(line, i + tlen)
+            }
+            print out line
+        }'
+}
+
 ###############################################################################
 # ENDPOINT PROBE (opt-in, OFF by default: ENABLE_ENDPOINT_PROBE=1)
 #
@@ -2566,7 +2590,15 @@ echo -e "${RED}Critical : $CRITICAL${NC}"
 echo -e "${RED}Errors   : $ERRORS${NC}"
 echo -e "${YELLOW}Warnings : $WARNINGS${NC}"
 echo -e "${CYAN}Info     : $INFO${NC}"
-[ -n "$SEARCH_VALUE" ] && echo "Search '$SEARCH_VALUE': $SEARCH_OCCURRENCES occurrence(s) across $MATCHES source(s), $SEARCH_RESOURCES resource(s), $SEARCH_NAMESPACES namespace(s)"
+if [ -n "$SEARCH_VALUE" ]; then
+    echo "Search '$SEARCH_VALUE': $SEARCH_OCCURRENCES occurrence(s) across $MATCHES source(s), $SEARCH_RESOURCES resource(s), $SEARCH_NAMESPACES namespace(s)" | highlight_term
+    if [ -s "$MATCH_REPORT" ]; then
+        echo ""
+        echo "--- Search match preview (first 60 lines; full file: $MATCH_REPORT) ---"
+        head -60 "$MATCH_REPORT" | highlight_term
+        echo "--- end of preview ---"
+    fi
+fi
 echo "Root-cause candidates : $ROOT_CAUSE_COUNT (see $ROOTCAUSE_REPORT or index.html)"
 if [ "$ENABLE_ENDPOINT_PROBE" = "1" ]; then
     echo "Endpoint probes        : $PROBE_TOTAL probed, $PROBE_FAIL_COUNT failed (see $PROBE_REPORT or index.html)"
